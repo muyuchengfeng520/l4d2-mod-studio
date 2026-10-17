@@ -395,7 +395,7 @@ def probe_link_support() -> dict:
     except Exception:
         pass
     out["note"] = (
-        "符号链接可用：新建 mod 会建真链接（FireAxe 同款形态）"
+        "符号链接可用：新建 mod 会建带箭头的真链接"
         if out["symbolic"] else
         "符号链接不可用，但同卷硬链接可用：新建 mod 会建硬链接（同一份数据、不占双倍空间，"
         "文件列表里显示为普通文件）。想要带箭头的符号链接：开启 Windows 开发者模式，"

@@ -516,7 +516,7 @@ function rBrowse() {
   $('#view').innerHTML = `
     <h2>分类与标签</h2>
     <div class="lead">分类来自三层证据：仓库目录（人工整理）→ addoninfo.txt 官方内容标签 →
-      内置素材路径规则（数据源自 NekoVpk）。点任意 mod 可看完整判定依据。</div>
+      内置素材路径规则。点任意 mod 可看完整判定依据。</div>
 
     <div class="card">
       <div class="row" style="margin-bottom:10px">
@@ -782,7 +782,7 @@ function rRefine() {
   if (!S.refineKey && mods.length) S.refineKey = mods[0].key;
   $('#view').innerHTML = `
     <h2>组件精修</h2>
-    <div class="lead">把一个 mod 的 VPK 拆成「部件」，只保留你要的那部分 —— 这就是 NekoVpk 那种「单独功能启动」。
+    <div class="lead">把一个 mod 的 VPK 拆成「部件」，只保留你要的那部分，实现按部件单独启用。
       剔除前自动备份原件，默认另存新文件；写入后还会重读成品校验（目标必须消失、其余文件一个不少）。</div>
     <div class="card">
       <div class="row">
@@ -1644,6 +1644,13 @@ function openSettings() {
       <div class="muted" style="margin-top:8px">留空使用内置完整标签库（75 标签 / 204 条路径规则）；填入新版 TaggedAssets.jsonc 可覆盖内置版本。</div>
     </div>
     <div id="aiSetWrap">${aiSettingsCard()}</div>`;
+  // 关于：第三方数据来源声明放这里（GPL 合规），不混进功能说明
+  $('#drawerBody').insertAdjacentHTML('beforeend', `
+    <div class="card" style="margin-top:12px">
+      <h3>关于</h3>
+      <div class="muted small">L4D2 Mod Studio · MIT 许可。内置的素材标签库数据
+        源自开源项目 NekoVpk（GPL-3.0），以数据形式内联于程序中，与游戏本体无关。</div>
+    </div>`);
   openDrawer('设置');
   aiLoadCfg();
 }
@@ -2043,7 +2050,7 @@ function rAcquire() {
   const ac = S.ac;
   $('#view').innerHTML = `
     <h2>获取 mod</h2>
-    <div class="lead">把 mod 弄进你的 FireAxe 体系：本地 VPK 一键入库，或从创意工坊直接订阅下载。
+    <div class="lead">把 mod 整理进仓库：本地 VPK 一键入库，或从创意工坊直接下载。
       两者最终都落到同一个仓库结构（<span class="mono">&lt;仓库&gt;/&lt;分类&gt;/&lt;标题&gt;.workshop/</span>），
       addons 里建链接、addonlist.txt 自动登记。</div>
     <div class="row" style="margin-bottom:12px">
@@ -2326,7 +2333,7 @@ async function acProbeLink() {
   box.innerHTML = `<div class="note ${r.symbolic ? 'ok' : (r.hardlink ? 'warn' : 'bad')}">
     <div class="kv" style="grid-template-columns:92px 1fr">
       <div class="k">符号链接</div><div>${r.symbolic
-        ? '✅ 可用（FireAxe 同款，带 -> 箭头）'
+        ? '✅ 可用（带 -> 箭头）'
         : '❌ 不可用 <span class="muted small">' + esc(e.symbolic || '') + '</span>'}</div>
       <div class="k">硬链接</div><div>${r.hardlink
         ? '✅ 可用（同一份数据，不占双倍空间）'

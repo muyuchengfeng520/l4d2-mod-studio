@@ -226,7 +226,7 @@ def redundancy(mods: list[dict], addons_dir: str, addonlist_map: dict[str, bool]
     for d, ks in dirs.items():
         if len(ks) > 1:
             out["multi_vpk_dir"].append({"dir": d, "mods": ks,
-                                         "note": "同一 workshop 目录内多个 VPK，FireAxe 通常只保留一个"})
+                                         "note": "同一 workshop 目录内多个 VPK，游戏通常只加载一个"})
 
     # 统计口径：`total_findings` 是「需要用户处理的发现总数」。
     # `duplicate_content`（内部文件清单与大小完全相同的重复 mod）刻意不计入 ——

@@ -30,8 +30,8 @@ DRIVES = "CDEFGH"
 
 DEFAULT = {
     "game_dir": "",           # …\Left 4 Dead 2\left4dead2
-    "repo_dir": "",           # FireAxe 素材仓库（可选）
-    "taglib": "",             # NekoVpk TaggedAssets.jsonc（可选，留空用内置）
+    "repo_dir": "",           # mod 仓库根（可选，留空用工具默认位置）
+    "taglib": "",             # 外部标签库 TaggedAssets.jsonc（可选，留空用内置完整库）
 }
 
 
@@ -301,10 +301,10 @@ def autodetect_repo() -> tuple[str, list[str]]:
                     continue
             break
         if os.path.isdir(cand):
-            ev.append("命中 FireAxe 仓库: %s（%d 个分类容器，公共祖先回溯）"
+            ev.append("命中现有 mod 仓库: %s（%d 个分类容器，公共祖先回溯）"
                       % (cand, len(containers)))
             return cand, ev
-    ev.append("未探测到 FireAxe 仓库（可选，不影响主流程）")
+    ev.append("未探测到现有 mod 仓库，将使用工具默认位置")
     return "", ev
 
 
