@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L4D2 Mod Studio — 求生之路2 Mod 管理器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<!--
+  P0（本次修）：委托改造把 app.js 里那几行「直连监听」删掉了，却忘了给这里几个静态按钮补 data-act，
+  于是它们全部哑掉 —— 点「重新扫描 / 设置 / 关闭」和点导航 tab 一律没反应，
+  而 ACT 表里 tab / scan / settings / drawerClose 四个分支其实一直都在等着被触发。
+  这里只补 data-act 属性，不新增任何逻辑（分支已存在于 app.js:171-174）。
+-->
+<header>
+  <div class="logo">L4D2 <span>Mod Studio</span><span class="sub">求生之路2 · mod 分类 / 精修 / 审计</span></div>
+  <div class="headpath" id="headPath" aria-live="polite">正在探测游戏目录…</div>
+  <button class="btn" id="btnScan" type="button" data-act="scan">重新扫描</button>
+  <button class="btn ghost" id="btnSettings" type="button" data-act="settings">设置</button>
+</header>
+
+<main>
+  <nav role="tablist" aria-label="主导航">
+    <div class="nstitle" role="presentation">mod</div>
+    <button type="button" role="tab" id="tab-overview" data-tab="overview" data-act="tab" aria-controls="view" aria-selected="true" tabindex="0" class="on"><span class="ic" aria-hidden="true">◈</span>总览</button>
+    <button type="button" role="tab" id="tab-browse" data-tab="browse" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">▤</span>分类与标签<span class="cnt" id="navMods">–</span></button>
+    <button type="button" role="tab" id="tab-refine" data-tab="refine" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">✂</span>组件精修<span class="cnt" id="navRefine">–</span></button>
+    <button type="button" role="tab" id="tab-reassign" data-tab="reassign" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">⇄</span>模型归属</button>
+    <button type="button" role="tab" id="tab-acquire" data-tab="acquire" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">⇩</span>获取 mod</button>
+    <button type="button" role="tab" id="tab-audit" data-tab="audit" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">⚑</span>冲突与缺失<span class="cnt" id="navAudit">–</span></button>
+    <div class="nstitle" role="presentation">游戏本体</div>
+    <button type="button" role="tab" id="tab-gamefiles" data-tab="gamefiles" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">▷</span>启动/加载/大厅</button>
+    <div class="nstitle" role="presentation">安全</div>
+    <button type="button" role="tab" id="tab-staging" data-tab="staging" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">▣</span>隔离区<span class="cnt" id="navStaging">–</span></button>
+    <button type="button" role="tab" id="tab-safety" data-tab="safety" data-act="tab" aria-controls="view" aria-selected="false" tabindex="-1"><span class="ic" aria-hidden="true">⌸</span>备份与日志</button>
+  </nav>
+
+  <section id="view" role="tabpanel" aria-labelledby="tab-overview" tabindex="-1"></section>
+</main>
+
+<!-- 点遮罩关抽屉：旧版是 $('#scrim').onclick，改造时一并丢了；补 data-act 复用同一个 closeDrawer -->
+<div class="scrim" id="scrim" data-act="drawerClose" aria-hidden="true"></div>
+<div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+  <header class="dh">
+    <b id="drawerTitle">详情</b>
+    <div class="spacer" style="flex:1"></div>
+    <button class="btn ghost sm" id="drawerClose" type="button" data-act="drawerClose">关闭</button>
+  </header>
+  <div class="dbody" id="drawerBody"></div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
