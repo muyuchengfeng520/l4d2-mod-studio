@@ -96,8 +96,16 @@ def _next_link_name(addons_dir: str, taken: set) -> str:
         i += 1
 
 
-def _vpk_title(vpk_path: str, addoninfo: dict) -> str:
-    """标题优先级：addoninfo.addontitle > 文件名（剥掉 -time_updated 后缀）。"""
+def _vpk_title(vpk_path: str, addoninfo: dict, title_hint: str = "") -> str:
+    """标题优先级：外部提示（创意工坊 title）> addoninfo.addontitle > 文件名。
+
+    title_hint 是「这个 VPK 从哪来」的权威标题：直下时 Steam Web API 的 title
+    比 VPK 内部的 addontitle 更可靠（有些作者不写 addoninfo，或写得跟创意工坊
+    标题不一致）。没有外部提示时才退回 VPK 内部与文件名。
+    """
+    t = (title_hint or "").strip()
+    if t:
+        return t
     t = (addoninfo or {}).get("addontitle", "").strip()
     if t:
         return t
@@ -159,7 +167,7 @@ def _find_dup(addons: str, dst_vpk: str) -> str:
 # --------------------------------------------------------------------------- #
 # 1) 解析 + 分类（入库的第一步：读懂这个 VPK 是什么）
 # --------------------------------------------------------------------------- #
-def inspect_vpk(vpk_path: str, cfg: dict) -> dict:
+def inspect_vpk(vpk_path: str, cfg: dict, title_hint: str = "") -> dict:
     """读 VPK 内部，判定分类与标题。只读，不碰任何文件。"""
     v = Vpk(vpk_path)
     paths_ = v.list_files()
@@ -171,7 +179,7 @@ def inspect_vpk(vpk_path: str, cfg: dict) -> dict:
 
     # 复用 scan 的分类打分：造一个临时 ModRecord 喂给 classify
     rec = scan.ModRecord(key=os.path.basename(vpk_path),
-                         title=_vpk_title(vpk_path, ai),
+                         title=_vpk_title(vpk_path, ai, title_hint),
                          _vpk_path=vpk_path, _vpaths=paths_, _addoninfo=ai)
     scan.classify(rec, cfg)
 
@@ -181,7 +189,7 @@ def inspect_vpk(vpk_path: str, cfg: dict) -> dict:
         "size": os.path.getsize(vpk_path),
         "size_h": _h(os.path.getsize(vpk_path)),
         "total_files": len(paths_),
-        "title": _vpk_title(vpk_path, ai),
+        "title": _vpk_title(vpk_path, ai, title_hint),
         "published_id": str(ai.get("publishedfileid", "") or ""),
         "category": rec.category,
         "category_zh": tl.CATEGORIES[rec.category]["zh"],
@@ -195,8 +203,14 @@ def inspect_vpk(vpk_path: str, cfg: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # 2) 入库预演（只读）
 # --------------------------------------------------------------------------- #
-def plan_ingest(cfg: dict, src_vpk: str) -> dict:
-    """算出入库后的完整落点，检查冲突。不写任何文件。"""
+def plan_ingest(cfg: dict, src_vpk: str, meta: dict = None) -> dict:
+    """算出入库后的完整落点，检查冲突。不写任何文件。
+
+    meta（可选）：来自下载渠道的元信息 {title, published_id, time_updated}。
+    传入时优先于 VPK 内部的 addoninfo —— 创意工坊标题比作者随手写的
+    addontitle 更可信，item id 只有下载渠道知道。
+    """
+    meta = meta or {}
     if not os.path.isfile(src_vpk):
         return {"ok": False, "error": "文件不存在: %s" % src_vpk}
     if not src_vpk.lower().endswith(".vpk"):
@@ -207,7 +221,12 @@ def plan_ingest(cfg: dict, src_vpk: str) -> dict:
                 "error": "还没配置 FireAxe 仓库目录（设置页探测或手动填一个）"}
 
     try:
-        info = inspect_vpk(src_vpk, cfg)
+        info = inspect_vpk(src_vpk, cfg, meta.get("title", ""))
+        # 外部来源的 item id 覆盖 VPK 内部解析结果（内部通常没有这个字段）
+        if meta.get("published_id"):
+            info["published_id"] = str(meta["published_id"])
+        if meta.get("time_updated"):
+            info["src_time_updated"] = int(meta["time_updated"])
     except VpkError as ex:
         return {"ok": False, "error": "VPK 解析失败: %s" % ex}
     except Exception as ex:
@@ -216,7 +235,9 @@ def plan_ingest(cfg: dict, src_vpk: str) -> dict:
     cat_dir = _repo_category_dir(repo_dir, info["category"])
     ws_dir = os.path.join(repo_dir, cat_dir, "%s.workshop" % _sanitize_title(info["title"]))
     # VPK 落库文件名沿用 FireAxe 规律：<标题>-time_updated-<ts>.vpk
-    ts = int(os.path.getmtime(src_vpk))
+    # ts 优先取外部来源的真实更新时间（创意工坊的 time_updated），
+    # 拿不到才退回文件修改时间 —— 否则下载时间会污染版本号。
+    ts = int(info.get("src_time_updated") or os.path.getmtime(src_vpk))
     dst_name = "%s-time_updated-%d.vpk" % (_sanitize_title(info["title"]), ts)
     dst_vpk = os.path.join(ws_dir, dst_name)
 
@@ -309,7 +330,7 @@ def _verify_link(link_path: str, target: str) -> bool:
 # --------------------------------------------------------------------------- #
 # 4) 入库执行
 # --------------------------------------------------------------------------- #
-def ingest(cfg: dict, src_vpk: str, mode: str = "move") -> dict:
+def ingest(cfg: dict, src_vpk: str, mode: str = "move", meta: dict = None) -> dict:
     """执行入库。mode: move（成功后源文件进回收站，默认）| copy（保留源文件）。
 
     ⚠️ 为什么 move 不是「直接 shutil.move」：move 完源文件就没了，后面任何一步
@@ -319,7 +340,7 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move") -> dict:
 
     返回 {ok, ...}；任何一步失败都已回滚，不留半成品。
     """
-    p = plan_ingest(cfg, src_vpk)
+    p = plan_ingest(cfg, src_vpk, meta)
     if not p.get("ok"):
         return p
     info = p["info"]
@@ -357,7 +378,7 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move") -> dict:
         log.append("重复入库检测通过")
 
         # 3) 写 .workshop 元数据（原子写：tmp + replace）
-        ts = int(os.path.getmtime(dst_vpk))
+        ts = int(info.get("src_time_updated") or os.path.getmtime(dst_vpk))
         meta = {
             "PublishedFileId": int(info["published_id"]) if info.get("published_id", "").isdigit() else 0,
             "TimeUpdated": ts,
@@ -376,11 +397,20 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move") -> dict:
         os.makedirs(addons, exist_ok=True)
         link_ok, link_how = _create_link(link_path, dst_vpk)
         if not link_ok:
-            # 降级：把 VPK 复制进 addons（游戏照样加载，但占双倍空间、
-            # 不随仓库实体更新——界面上必须如实标注）
+            # 降级：把 VPK 复制进 addons。文件名**用标题**而不是 studio_link_N ——
+            # 副本没有「链接 -> 实体」的映射，扫描器只能从文件名推标题；
+            # 若用 studio_link_N，界面与游戏内 addon 列表都会只剩一个编号。
+            base = _sanitize_title(info["title"])
+            alt = base + ".vpk"
+            n = 2
+            while os.path.lexists(os.path.join(addons, alt)):
+                alt = "%s (%d).vpk" % (base, n)
+                n += 1
+            link_path = os.path.join(addons, alt)
+            link_name = alt
             shutil.copy2(dst_vpk, link_path)
             link_how = "副本（降级）"
-            log.append("符号链接不可用，已降级为复制")
+            log.append("符号链接不可用，已降级为复制：%s" % alt)
         else:
             log.append("链接 %s -> %s" % (link_name, os.path.basename(dst_vpk)))
         done.append("link")
@@ -426,8 +456,10 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move") -> dict:
         "log": log,
         "note": ("addons 里是符号链接，改仓库里的实体会直接生效"
                  if link_how == "符号链接" else
-                 "⚠ 当前环境建不了符号链接，addons 里放的是副本：占双倍空间、"
-                 "且不会随仓库实体更新。想用链接模式，请以管理员身份运行本工具"),
+                 "⚠ 当前环境建不了符号链接，addons 里放的是副本（占双倍空间、"
+                 "不随仓库实体更新）。根治办法：Windows 设置 → 隐私和安全性 → "
+                 "开发者选项 → 打开「开发人员模式」，之后重启本工具即可改用链接；"
+                 "或以管理员身份运行本工具。"),
     }
 
 
@@ -815,7 +847,10 @@ def workshop_download_direct(cfg: dict, item_id: str) -> dict:
                 return
             say("VPK 魔数校验通过，开始入库…")
             job["percent"] = 99
-            r = ingest(cfg, tmp_vpk, mode="move")
+            r = ingest(cfg, tmp_vpk, mode="move",
+                       meta={"title": det.get("title", ""),
+                             "published_id": item_id,
+                             "time_updated": det.get("time_updated", 0)})
             if not r.get("ok"):
                 job["state"] = "failed"
                 job["result"] = {"ok": False, "error": r.get("error", "入库失败")}
