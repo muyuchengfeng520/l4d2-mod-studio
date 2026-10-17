@@ -101,16 +101,6 @@ def _unique_vpk_name(addons_dir: str, base: str) -> str:
     return name
 
 
-def _next_link_name(addons_dir: str, taken: set) -> str:
-    """生成不冲突的链接名：studio_link_1.vpk / studio_link_2.vpk ..."""
-    i = 1
-    while True:
-        name = "%s_%d.vpk" % (LINK_PREFIX, i)
-        if name not in taken and not os.path.lexists(os.path.join(addons_dir, name)):
-            return name
-        i += 1
-
-
 def _vpk_title(vpk_path: str, addoninfo: dict, title_hint: str = "") -> str:
     """标题优先级：外部提示（创意工坊 title）> addoninfo.addontitle > 文件名。
 
