@@ -1,5 +1,6 @@
 # L4D2 Mod Studio
 
+A VPK-aware mod manager for Left 4 Dead 2.
 《求生之路 2》mod 管理器（Windows 桌面程序）。围绕 **VPK 内部结构**做管理，而不是只看文件名：
 分类依据 `addoninfo.txt` 与内部路径，修改保持在字节级可校验的范围内。
 
