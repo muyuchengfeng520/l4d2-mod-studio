@@ -899,6 +899,11 @@ def api_acquire_install(ctx: Ctx) -> dict:
     return acquire.install_steamcmd(ack=bool(ctx.body.get("ack")))
 
 
+def api_acquire_linkprobe(ctx: Ctx) -> dict:
+    """链接能力自检：当前进程能否建符号链接 / 硬链接（排障用）。"""
+    return acquire.probe_link_support()
+
+
 def api_acquire_env(ctx: Ctx) -> dict:
     """网络环境探测：SteamCMD 通道可不可用（hosts 劫持 / PAC 状态）。"""
     return acquire.detect_network_env()

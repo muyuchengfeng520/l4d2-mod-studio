@@ -337,6 +337,69 @@ def _create_link(link_path: str, target: str) -> tuple[bool, str]:
     return False, "符号链接与硬链接都不可用（%s）；跨卷时需管理员身份或开启 Windows 开发者模式" % why2
 
 
+def probe_link_support() -> dict:
+    """自检：当前进程能否创建符号链接 / 硬链接。
+
+    在 data/cache 下建临时文件试一次，验证语义后立即清理。
+    这是给排障用的——「为什么 addons 里是副本」这类问题，一次自检就有答案。
+    """
+    import tempfile
+    out = {"symbolic": False, "hardlink": False, "same_volume": True, "errors": {}}
+    cache = os.path.join(safety.DATA_DIR, "cache")
+    os.makedirs(cache, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="linkprobe_", dir=cache)
+    target = os.path.join(tmp, "target.vpk")
+    try:
+        with open(target, "wb") as fp:
+            fp.write(b"probe" * 100)
+        # ① 符号链接
+        p1 = os.path.join(tmp, "sym.vpk")
+        try:
+            os.symlink(target, p1)
+            out["symbolic"] = bool(os.path.islink(p1)
+                                   and os.path.samefile(p1, target))
+            if not out["symbolic"]:
+                out["errors"]["symbolic"] = "创建成功但验证失败（islink/samefile 不符）"
+        except OSError as ex:
+            out["errors"]["symbolic"] = "%s" % ex
+        if os.path.lexists(p1):
+            try:
+                os.unlink(p1)
+            except OSError:
+                pass
+        # ② 硬链接
+        p2 = os.path.join(tmp, "hard.vpk")
+        ok2, why2 = _create_hardlink(p2, target)
+        out["hardlink"] = ok2
+        if not ok2:
+            out["errors"]["hardlink"] = why2
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+    # ③ 仓库与 addons 是否同卷（硬链接的前提）
+    try:
+        cfg = paths.load()
+        r = cfg.get("repo_dir", "")
+        a = paths.addons_dir(cfg)
+        if r and a and os.path.exists(r) and os.path.exists(a):
+            out["same_volume"] = (os.stat(r).st_dev == os.stat(a).st_dev)
+            out["repo"] = r
+            out["addons"] = a
+    except Exception:
+        pass
+    out["note"] = (
+        "符号链接可用：新建 mod 会建真链接（FireAxe 同款形态）"
+        if out["symbolic"] else
+        "符号链接不可用，但同卷硬链接可用：新建 mod 会建硬链接（同一份数据、不占双倍空间，"
+        "文件列表里显示为普通文件）。想要带箭头的符号链接：开启 Windows 开发者模式，"
+        "或让本程序以管理员身份运行。"
+        if out["hardlink"] and out["same_volume"] else
+        "链接都不可用：新建 mod 会复制进 addons（占双倍空间）。"
+        "把仓库与游戏放在同一分区（硬链接）或开启开发者模式（符号链接）可解决。"
+    )
+    return out
+
+
 def _create_hardlink(link_path: str, target: str) -> tuple:
     """建硬链接。返回 (成功?, 说明)。
 

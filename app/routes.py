@@ -127,6 +127,7 @@ GET_ROUTES = [
     Route("/api/reassign/detect", api.api_reassign_detect),
     Route("/api/acquire/steamcmd", api.api_acquire_steamcmd),
     Route("/api/acquire/env", api.api_acquire_env),
+    Route("/api/acquire/linkprobe", api.api_acquire_linkprobe),
     Route("/api/acquire/job", api.api_acquire_job),
 ]
 

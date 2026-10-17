@@ -214,6 +214,7 @@ const ACT = {
   acRescanScmd: () => acRescanScmd(),
   acInstall: () => acInstall(),
   acBrowser: () => acBrowser(),
+  acProbeLink: () => acProbeLink(),
   acCancel: () => acCancel(),
   /* 分组标题行折叠：委托用 closest() 取「最近的」[data-act]，
      所以点行内「选中 / 取消」按钮时命中的是按钮本身，不会连带折叠。 */
@@ -2062,7 +2063,14 @@ function acIngestBody() {
         data-act="acMode" ${ac.mode === 'copy' ? 'checked' : ''}> 复制入库（保留源文件不动）</label>
     </div>
     <div id="acPlanBox" style="margin-top:12px">${
-      p ? (p.ok ? acPlanBody(p) : `<div class="note bad">${esc(p.error || '预演失败')}</div>`) : ''}</div>`;
+      p ? (p.ok ? acPlanBody(p) : `<div class="note bad">${esc(p.error || '预演失败')}</div>`) : ''}</div>
+    <div class="card" style="margin-top:12px">
+      <h3>链接能力自检</h3>
+      <div class="muted" style="margin-bottom:6px">入库时 addons 里放的是「链接」还是「副本」，
+        取决于本机权限。点一下就知道这台机器能建哪种。</div>
+      <button class="btn small" data-act="acProbeLink">检测</button>
+      <div id="acProbeBox" style="margin-top:8px"></div>
+    </div>`;
 }
 
 function acPlanBody(p) {
@@ -2293,4 +2301,27 @@ async function acInstall() {
     S.ac.job = { id: r.job, kind: 'install', item_id: '', state: 'running', log: [], result: null, percent: 0 };
     acJobPoll(r.job);
   });
+}
+
+/* 链接能力自检：告诉用户这台机器能建符号链接还是只能硬链接 */
+async function acProbeLink() {
+  const box = $('#acProbeBox');
+  if (!box) return;
+  box.innerHTML = spinner('检测中…');
+  const r = await api('/api/acquire/linkprobe');
+  const e = r.errors || {};
+  box.innerHTML = `<div class="note ${r.symbolic ? 'ok' : (r.hardlink ? 'warn' : 'bad')}">
+    <div class="kv" style="grid-template-columns:92px 1fr">
+      <div class="k">符号链接</div><div>${r.symbolic
+        ? '✅ 可用（FireAxe 同款，带 -> 箭头）'
+        : '❌ 不可用 <span class="muted small">' + esc(e.symbolic || '') + '</span>'}</div>
+      <div class="k">硬链接</div><div>${r.hardlink
+        ? '✅ 可用（同一份数据，不占双倍空间）'
+        : '❌ 不可用 <span class="muted small">' + esc(e.hardlink || '') + '</span>'}</div>
+      <div class="k">同卷</div><div>${r.same_volume
+        ? '✅ 仓库与 addons 在同一分区'
+        : '❌ 不在同一分区（硬链接不可用）'}</div>
+    </div>
+    <div class="muted small" style="margin-top:6px">${esc(r.note || '')}</div>
+  </div>`;
 }
