@@ -371,7 +371,16 @@ def api_vpk_apply(ctx: Ctx) -> dict:
             safety.log("vpk-apply", "校验失败，已放弃写入: %s" % ver, level="ERROR", ok=False)
             return {"ok": False, "error": "完整性校验未通过，已放弃改动（原件未变）",
                     "verify": ver, "backup": bkp}
+        # replace 会换 inode：先记下指向该实体的 addons 条目，写完重建硬链接
+        # （符号链接不用管，它跟路径自动走；硬链接断了自己重建）
+        _addons = paths.addons_dir(ctx.get_cfg())
+        _links = acquire.link_entries(_addons, src)
         os.replace(tmp, out)
+        if _links:
+            _fixed = acquire.refresh_links(_addons, out, _links)
+            safety.log("vpk-apply", "重建硬链接 %d 条：%s"
+                       % (len([x for x in _fixed if x[1]]),
+                          ", ".join(n for n, _ok in _fixed)))
     else:
         stem, ext = os.path.splitext(src)
         out = "%s_stripped%s" % (stem, ext)
@@ -812,7 +821,13 @@ def api_reassign_apply(ctx: Ctx) -> dict:
                            % (res.get("校验") or {}), level="ERROR", ok=False)
                 return {"ok": False, "error": "完整性校验未通过，已放弃改动（原件未变）",
                         "verify": res.get("校验"), "backup": bkp}
+            _addons2 = paths.addons_dir(ctx.get_cfg())
+            _links2 = acquire.link_entries(_addons2, src)
             os.replace(tmp, out)
+            if _links2:
+                _fixed2 = acquire.refresh_links(_addons2, out, _links2)
+                safety.log("reassign-apply", "重建硬链接 %d 条"
+                           % len([x for x in _fixed2 if x[1]]))
         except Exception as ex:
             try:
                 os.unlink(tmp)

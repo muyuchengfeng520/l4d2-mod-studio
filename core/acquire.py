@@ -86,6 +86,21 @@ def _repo_category_dir(repo_dir: str, cat: str) -> str:
     return "%02d-%s" % (order, zh)
 
 
+def _unique_vpk_name(addons_dir: str, base: str) -> str:
+    """在 addons 里生成不冲突的 VPK 名：<标题>.vpk / <标题> (2).vpk …
+
+    为什么链接名直接用标题而不是 studio_link_N：符号链接靠 realpath 反推标题，
+    硬链接与副本都反推不了，扫描器只能从文件名读 —— 用编号命名会让界面和
+    游戏内 addon 列表都只剩一个 studio_link_3 这样的编号。
+    """
+    name = base + ".vpk"
+    n = 2
+    while os.path.lexists(os.path.join(addons_dir, name)):
+        name = "%s (%d).vpk" % (base, n)
+        n += 1
+    return name
+
+
 def _next_link_name(addons_dir: str, taken: set) -> str:
     """生成不冲突的链接名：studio_link_1.vpk / studio_link_2.vpk ..."""
     i = 1
@@ -314,7 +329,86 @@ def _create_link(link_path: str, target: str) -> tuple[bool, str]:
                 os.unlink(link_path)
         except OSError:
             pass
-    return False, "当前环境无法创建符号链接（需要管理员身份或开启 Windows 开发者模式）"
+    # ③ 最后试硬链接：Windows 上不需要任何特权，只要同卷 + NTFS。
+    #    仓库与 addons 通常在同一盘（本机都在 E:），命中率很高。
+    ok2, why2 = _create_hardlink(link_path, target)
+    if ok2:
+        return True, why2
+    return False, "符号链接与硬链接都不可用（%s）；跨卷时需管理员身份或开启 Windows 开发者模式" % why2
+
+
+def _create_hardlink(link_path: str, target: str) -> tuple:
+    """建硬链接。返回 (成功?, 说明)。
+
+    **不需要任何特权**（Windows 普通用户即可）——实测 CreateHardLinkW 返回 1。
+    Vortex 的默认部署方式就是硬链接；符号链接才需要管理员/开发者模式。
+    限制：必须同一卷（同一分区）+ NTFS；只对文件有效。
+    """
+    if os.path.lexists(link_path):
+        return False, "目标已存在"
+    try:
+        ok = ctypes.windll.kernel32.CreateHardLinkW(link_path, target, None)
+    except Exception as ex:
+        return False, "CreateHardLinkW 异常: %s" % ex
+    if not ok:
+        return False, "CreateHardLinkW 失败（错误码 %s）" % ctypes.get_last_error()
+    # 验证：必须是同一文件（硬链接的判据是 samefile，不是 islink）
+    try:
+        if os.path.samefile(link_path, target):
+            return True, "硬链接"
+    except OSError:
+        pass
+    return False, "硬链接创建后校验失败"
+
+
+def link_entries(addons_dir: str, vault_path: str) -> list:
+    """列出 addons 里当前指向 vault_path 的条目名（符号链接或硬链接）。
+
+    必须在**写操作之前**调用：os.replace 换了 inode 之后，硬链接条目就再也
+    认不出自己原来指向谁了（samefile 变 False）。
+    """
+    names = []
+    if not os.path.isdir(addons_dir) or not os.path.isfile(vault_path):
+        return names
+    for n in os.listdir(addons_dir):
+        p = os.path.join(addons_dir, n)
+        if not os.path.lexists(p):
+            continue
+        try:
+            if os.path.samefile(p, vault_path):
+                names.append(n)
+        except OSError:
+            continue
+    return names
+
+
+def refresh_links(addons_dir: str, vault_path: str, names: list) -> list:
+    """写操作（os.replace）之后重建断掉的硬链接。
+
+    符号链接不用管：它指向路径，replace 之后自动跟随新文件。
+    硬链接指向 inode，replace 换了 inode 就断了 —— 这里删掉旧条目重新建。
+    ⚠️ unlink 硬链接**不是删除数据**：只是减一个引用计数，实体仍在 vault 里，
+    所以这里不走回收站（走了反而会把还在用的 vpk 一起搬走）。
+    """
+    fixed = []
+    for n in names:
+        p = os.path.join(addons_dir, n)
+        if not os.path.lexists(p):
+            continue
+        if os.path.islink(p):
+            continue                      # 符号链接自动跟随，无需处理
+        try:
+            if os.path.samefile(p, vault_path):
+                continue                  # 还是同一个文件，没断
+        except OSError:
+            pass
+        try:
+            os.unlink(p)                  # 切断这条旧硬链接（数据不受影响）
+        except OSError:
+            continue
+        ok, _how = _create_hardlink(p, vault_path)
+        fixed.append((n, ok))
+    return fixed
 
 
 def _verify_link(link_path: str, target: str) -> bool:
@@ -391,26 +485,16 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move", meta: dict = None) -> di
         done.append("meta")
         log.append("写入元数据 .workshop")
 
-        # 4) addons 建符号链接（失败降级为复制）
-        link_name = _next_link_name(addons, set())
+        # 4) addons 建链接：符号链接 -> 硬链接 -> 副本，名字统一用标题
+        link_name = _unique_vpk_name(addons, _sanitize_title(info["title"]))
         link_path = os.path.join(addons, link_name)
         os.makedirs(addons, exist_ok=True)
         link_ok, link_how = _create_link(link_path, dst_vpk)
         if not link_ok:
-            # 降级：把 VPK 复制进 addons。文件名**用标题**而不是 studio_link_N ——
-            # 副本没有「链接 -> 实体」的映射，扫描器只能从文件名推标题；
-            # 若用 studio_link_N，界面与游戏内 addon 列表都会只剩一个编号。
-            base = _sanitize_title(info["title"])
-            alt = base + ".vpk"
-            n = 2
-            while os.path.lexists(os.path.join(addons, alt)):
-                alt = "%s (%d).vpk" % (base, n)
-                n += 1
-            link_path = os.path.join(addons, alt)
-            link_name = alt
+            # 降级：链接一律建不了才复制（跨卷 + 无特权时才会走到这）
             shutil.copy2(dst_vpk, link_path)
             link_how = "副本（降级）"
-            log.append("符号链接不可用，已降级为复制：%s" % alt)
+            log.append("链接不可用，已降级为复制：%s" % link_name)
         else:
             log.append("链接 %s -> %s" % (link_name, os.path.basename(dst_vpk)))
         done.append("link")
@@ -454,12 +538,12 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move", meta: dict = None) -> di
         "size_h": info["size_h"],
         "total_files": info["total_files"],
         "log": log,
-        "note": ("addons 里是符号链接，改仓库里的实体会直接生效"
+        "note": ("addons 里是符号链接，改仓库实体直接生效"
                  if link_how == "符号链接" else
-                 "⚠ 当前环境建不了符号链接，addons 里放的是副本（占双倍空间、"
-                 "不随仓库实体更新）。根治办法：Windows 设置 → 隐私和安全性 → "
-                 "开发者选项 → 打开「开发人员模式」，之后重启本工具即可改用链接；"
-                 "或以管理员身份运行本工具。"),
+                 "addons 里是硬链接（同一份数据，不占双倍空间；写操作后工具会自动重建）"
+                 if link_how == "硬链接" else
+                 "⚠ 链接不可用，addons 里是独立副本（占双倍空间、不随实体更新）。"
+                 "同盘环境下正常不该出现；若出现请检查两处是否在同一分区/NTFS。"),
     }
 
 
