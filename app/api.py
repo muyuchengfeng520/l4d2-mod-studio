@@ -139,7 +139,7 @@ def api_set_config(ctx: Ctx) -> dict:
     if b.get("game_dir"):
         v = paths.validate_game_dir(b["game_dir"])
         if not v["ok"]:
-            return {"ok": False, "error": "该目录不像 L4D2 的 left4dead2 目录",
+            return {"ok": False, "error": "这个目录不像 left4dead2：应包含 pak01_dir.vpk 与 addons 目录",
                     "checks": v["checks"]}
         ok["game_dir"] = os.path.abspath(b["game_dir"])
     for k in ("repo_dir", "taglib"):

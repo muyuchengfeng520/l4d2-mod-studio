@@ -439,7 +439,7 @@ function rOverview() {
   $('#view').innerHTML = `
     <h2>总览</h2>
     <div class="lead">扫描 ${s.total} 个 mod，总占用 ${esc(s.total_size_h)}，耗时 ${S.scan.elapsed}s。
-      以下数据全部来自 VPK 目录树与 addoninfo.txt 的实测解析，可作为复核依据。</div>
+      数据来自 VPK 目录树与 addoninfo.txt 的解析结果。</div>
 
     <div class="grid g4">
       <div class="stat"><div class="n">${s.total}</div><div class="l">mod 总数</div></div>
@@ -484,13 +484,13 @@ function rOverview() {
     </div>` : ''}
 
     <div class="card">
-      <h3>探测依据 <span class="tagline">为什么是这个目录 —— 每条都可复核</span></h3>
+      <h3>探测依据 <span class="tagline">各候选的探测打分</span></h3>
       ${(S.scan.evidence || []).map(e => `<div class="ev mono small">${esc(e)}</div>`).join('')}
       ${tl ? `<div class="ev mono small">标签库：${esc(tl.source)}（${tl.tags} 个标签 / ${tl.rules} 条路径规则）</div>` : ''}
     </div>
 
     <div class="card">
-      <h3>仓库里没接进 addons 的 mod（${(S.scan.unlinked || []).length}）<span class="tagline">仓库有素材，但游戏加载不到</span></h3>
+      <h3>仓库里没接进 addons 的 mod（${(S.scan.unlinked || []).length}）<span class="tagline">仓库里有文件，但游戏加载不到</span></h3>
       ${(S.scan.unlinked || []).length ? `<div class="tblwrap"><table>
         <tr><th>分类目录</th><th>标题</th><th>原因</th></tr>
         ${S.scan.unlinked.slice(0, 60).map(u => `<tr><td>${esc(u.category || '')}</td>
@@ -515,8 +515,8 @@ function rBrowse() {
   const s = S.scan.summary;
   $('#view').innerHTML = `
     <h2>分类与标签</h2>
-    <div class="lead">分类来自三层证据：FireAxe 仓库目录（人工整理）→ addoninfo.txt 官方内容标签 → NekoVpk 素材级路径规则。
-      点任意 mod 看它的完整判定依据。</div>
+    <div class="lead">分类来自三层证据：仓库目录（人工整理）→ addoninfo.txt 官方内容标签 →
+      内置素材路径规则（数据源自 NekoVpk）。点任意 mod 可看完整判定依据。</div>
 
     <div class="card">
       <div class="row" style="margin-bottom:10px">
@@ -1133,7 +1133,7 @@ async function openMod(key) {
         <div class="k">内容判定</div><div>${esc(S.scan.categories[m.auto_category]?.zh || m.auto_category)} ${m.mismatch ? '<span class="pill warn">与仓库归类冲突</span>' : ''}</div>
         <div class="k">启用状态</div><div>${m.enabled ? '<span class="pill ok">已启用</span>' : '<span class="pill">未启用</span>'} ${m.registered ? '' : '<span class="pill bad">未登记在 addonlist</span>'}</div>
         <div class="k">体积 / 文件数</div><div>${esc(m.size_h)} · ${m.entry_count} 个文件 · VPK v${m.vpk_version}</div>
-        <div class="k">仓库分类</div><div>${esc(m.repo_category || '（非 FireAxe 仓库）')}</div>
+        <div class="k">仓库分类</div><div>${esc(m.repo_category || '（未归类）')}</div>
         <div class="k">创意工坊</div><div>${m.workshop_url ? `<a href="${escAttr(m.workshop_url)}" target="_blank">${esc(m.published_id)}（${esc(m.updated_h)}）</a>` : '–'}</div>
         <div class="k">实体路径</div><div class="mono small">${esc(m.real_path)}</div>
         <div class="k">标签</div><div>${(m.tags || []).map(t => `<span class="pill acc">${esc(t)}</span>`).join(' ') || '<span class="muted">未命中素材标签</span>'}</div>
@@ -1384,7 +1384,7 @@ async function rGameFiles() {
     </div>
     <div id="gfEditBox"></div>
     <div class="card">
-      <h3>说明 <span class="tagline">为什么这么做</span></h3>
+      <h3>说明 <span class="tagline">生效方式</span></h3>
       <div class="ev mono small">media\\*.bik —— 散装文件，直接覆盖 left4dead2\\media\\ 下同名文件即可生效</div>
       <div class="ev mono small">materials\\vgui\\loadingscreen_*.vtf —— 原本打包在 pak01_dir.vpk 内；放同路径散装文件到 left4dead2\\ 下，散装优先覆盖</div>
       <div class="ev mono small">media\\startupvids.txt —— 控制启动时播哪几段视频（可用来跳过片头）</div>
@@ -1485,8 +1485,8 @@ async function rStaging() {
   const nav = $('#navStaging'); if (nav) nav.textContent = items.length;
   v.innerHTML = `
     <h2>隔离区</h2>
-    <div class="lead">「卸载」= 把 mod 移到这里，而不是销毁。素材完整保留，随时可以搬回去。
-      每一条都记着它的原始位置，还原时不用你再指路。</div>
+    <div class="lead">「卸载」= 把 mod 移到这里而不是销毁，文件完整保留、随时可还原；
+      每条都记录了原始位置。</div>
     <div class="card">
       <div class="row" style="margin-bottom:9px">
         <b>${items.length} 项</b>
@@ -1570,7 +1570,7 @@ async function rSafety() {
   const bItems = (b && b.items) || [], lLines = (l && l.lines) || [];
   v.innerHTML = `
     <h2>备份与日志</h2>
-    <div class="lead">所有破坏性动作之前都会先备份；所有动作都留痕。这两个目录是这套工具的安全网。</div>
+    <div class="lead">破坏性操作前自动备份，所有动作写入日志。下面两个目录保存备份与隔离内容。</div>
     <div class="grid g2">
       <div class="card">
         <h3>安全策略 <span class="tagline">不可绕过</span></h3>
@@ -1618,7 +1618,7 @@ function openSettings() {
       <h3>路径设置</h3>
       <div class="kv" style="grid-template-columns:110px 1fr">
         <div class="k">游戏目录</div><div><input type="text" id="cfgGame" value="${escAttr(c.game_dir || '')}" style="width:100%"></div>
-        <div class="k">FireAxe 仓库</div><div><input type="text" id="cfgRepo" value="${escAttr(c.repo_dir || '')}" style="width:100%"></div>
+        <div class="k">mod 仓库</div><div><input type="text" id="cfgRepo" value="${escAttr(c.repo_dir || '')}" style="width:100%"></div>
         <div class="k">标签库</div><div><input type="text" id="cfgTag" value="${escAttr(c.taglib || '')}" style="width:100%"></div>
       </div>
       <div class="row" style="margin-top:10px">
@@ -1641,7 +1641,7 @@ function openSettings() {
         <div class="k">路径规则</div><div>${tl ? tl.rules + ' 条' : '-'}</div>
         <div class="k">状态</div><div>${tl ? (tl.error ? '<span class="pill bad">' + esc(tl.error) + '</span>' : '<span class="pill ok">正常</span>') : '<span class="pill gray">未知</span>'}</div>
       </div>
-      <div class="muted" style="margin-top:8px">留空则使用内置兜底标签库；填 NekoVpk 的 TaggedAssets.jsonc 路径可获得素材级精度。</div>
+      <div class="muted" style="margin-top:8px">留空使用内置完整标签库（75 标签 / 204 条路径规则）；填入新版 TaggedAssets.jsonc 可覆盖内置版本。</div>
     </div>
     <div id="aiSetWrap">${aiSettingsCard()}</div>`;
   openDrawer('设置');
@@ -2066,8 +2066,8 @@ function acIngestBody() {
         <button class="btn" data-act="acPick">浏览…</button>
         <button class="btn primary" data-act="acPlan">预演</button>
       </div>
-      <div class="muted" style="margin-top:6px">从任何渠道搞到的 .vpk 都行 —— 网页下载的、别人发的、旧备份里的。
-        预演会解析 VPK 内部、自动判定分类，不写任何文件。</div>
+      <div class="muted" style="margin-top:6px">任何来源的 .vpk 均可：网页下载、他人分享、旧备份。
+        预演只读取内容并判定分类，不写入任何文件。</div>
     </div>
     <div class="card" id="acModeCard" style="margin-top:12px">
       <h3>入库方式</h3>
@@ -2080,8 +2080,8 @@ function acIngestBody() {
       p ? (p.ok ? acPlanBody(p) : `<div class="note bad">${esc(p.error || '预演失败')}</div>`) : ''}</div>
     <div class="card" style="margin-top:12px">
       <h3>链接能力自检</h3>
-      <div class="muted" style="margin-bottom:6px">入库时 addons 里放的是「链接」还是「副本」，
-        取决于本机权限。点一下就知道这台机器能建哪种。</div>
+      <div class="muted" style="margin-bottom:6px">入库时 addons 里放链接还是副本，取决于本机权限。
+        检测可确认当前环境支持哪种。</div>
       <button class="btn small" data-act="acProbeLink">检测</button>
       <div id="acProbeBox" style="margin-top:8px"></div>
     </div>`;
@@ -2126,10 +2126,9 @@ function acWsBody() {
         <button class="btn primary" data-act="acDownload">下载并入库</button>
         <button class="btn" data-act="acBrowser">浏览器下载</button>
       </div>
-      <div class="muted" style="margin-top:6px">下载走 Valve 官方的 SteamCMD（匿名登录，公开 item 可直接下）；
-        下载完成的 VPK 自动走「一键入库」同一套落地流程。
-        若当前网络环境 SteamCMD 通道不可用（如 Steam++ 的 hosts 劫持半开状态），
-        可改用「浏览器下载」——浏览器能读系统代理，绕开劫持。</div>
+      <div class="muted" style="margin-top:6px">下载通道按可用性自动选择：检测到 SteamCMD 时用它，
+        否则经 Steam Web API 取直链、由系统 shell 下载（可复用系统代理），都不可用时回退浏览器。
+        下载完成的 VPK 自动走「一键入库」同一套落地流程。</div>
       <div class="row" style="margin-top:10px">
         <span class="muted">SteamCMD：</span>${scState}
         <button class="btn small" data-act="acRescanScmd">重新探测</button>
