@@ -25,7 +25,7 @@
 
 ## 快速开始
 
-**exe**：运行 `L4D2ModStudio.exe`。首次启动自动创建 `data/` 目录并探测游戏路径。
+**exe**：从 [Releases](../../releases) 下载 `L4D2ModStudio.exe` 后运行。首次启动自动创建 `data/` 目录并探测游戏路径。
 
 **源码**：需要 Python 3.10+。
 
