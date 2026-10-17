@@ -152,6 +152,7 @@ POST_ROUTES = [
     Route("/api/open-folder", api.api_open_folder),
     Route("/api/reassign/plan", api.api_reassign_plan),
     Route("/api/reassign/apply", api.api_reassign_apply),
+    Route("/api/mod/move-category", api.api_mod_move_category),
     Route("/api/acquire/plan", api.api_acquire_plan),
     Route("/api/acquire/ingest", api.api_acquire_ingest),
     Route("/api/acquire/workshop", api.api_acquire_workshop),

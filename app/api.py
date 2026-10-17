@@ -899,6 +899,29 @@ def api_acquire_install(ctx: Ctx) -> dict:
     return acquire.install_steamcmd(ack=bool(ctx.body.get("ack")))
 
 
+def api_mod_move_category(ctx: Ctx) -> dict:
+    """把 mod 的仓库分类目录移到另一个分类（两步确认）。"""
+    b = ctx.body
+    key = b.get("key", "")
+    cat = b.get("category", "")
+    idx = ctx.mod_index()
+    m = idx.get(key)
+    if not m:
+        return {"ok": False, "error": "找不到这个 mod"}
+    if not m.real_path:
+        return {"ok": False, "error": "这个 mod 没有实体文件路径"}
+    if not cat:
+        return {"ok": False, "error": "没指定目标分类"}
+    r = acquire.move_category(ctx.get_cfg(), m.real_path, cat,
+                              confirm=bool(b.get("confirm")))
+    if r.get("ok"):
+        try:
+            ctx.do_scan(force=True)      # 立刻反映到界面
+        except Exception:
+            pass
+    return r
+
+
 def api_acquire_linkprobe(ctx: Ctx) -> dict:
     """链接能力自检：当前进程能否建符号链接 / 硬链接（排障用）。"""
     return acquire.probe_link_support()

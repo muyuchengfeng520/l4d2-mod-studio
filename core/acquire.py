@@ -453,12 +453,15 @@ def link_entries(addons_dir: str, vault_path: str) -> list:
 
 
 def refresh_links(addons_dir: str, vault_path: str, names: list) -> list:
-    """写操作（os.replace）之后重建断掉的硬链接。
+    """重新连接 addons 里指向 vault 的条目。两种断法都要管：
 
-    符号链接不用管：它指向路径，replace 之后自动跟随新文件。
-    硬链接指向 inode，replace 换了 inode 就断了 —— 这里删掉旧条目重新建。
-    ⚠️ unlink 硬链接**不是删除数据**：只是减一个引用计数，实体仍在 vault 里，
-    所以这里不走回收站（走了反而会把还在用的 vpk 一起搬走）。
+    * **写操作（os.replace）换 inode** → 硬链接断（samefile 变 False），但路径没变
+    * **移动分类目录** → 符号链接断（路径变了指向不存在），硬链接不受影响
+
+    做法统一成「先建临时链接、成功才替换」：万一当前环境建不了链接
+    （跨卷/无权限），原条目原样保留，绝不会因为重建失败把 mod 弄丢。
+    ⚠️ unlink 链接**不是删除数据**：硬链接只是减引用计数，实体仍在 vault 里；
+       符号链接删的只是路标。所以这里不走回收站。
     """
     fixed = []
     for n in names:
@@ -466,17 +469,34 @@ def refresh_links(addons_dir: str, vault_path: str, names: list) -> list:
         if not os.path.lexists(p):
             continue
         if os.path.islink(p):
-            continue                      # 符号链接自动跟随，无需处理
-        try:
-            if os.path.samefile(p, vault_path):
-                continue                  # 还是同一个文件，没断
-        except OSError:
-            pass
-        try:
-            os.unlink(p)                  # 切断这条旧硬链接（数据不受影响）
-        except OSError:
-            continue
-        ok, _how = _create_hardlink(p, vault_path)
+            # 符号链接：指向的路径还在就不动，断了（移动过目录）才重建
+            try:
+                if os.path.exists(p) and os.path.samefile(p, vault_path):
+                    continue
+            except OSError:
+                pass
+        else:
+            # 硬链接 / 副本：同一个文件说明还连着；否则是 replace 换过 inode
+            try:
+                if os.path.samefile(p, vault_path):
+                    continue
+            except OSError:
+                pass
+        tmp_link = p + ".relink"
+        if os.path.lexists(tmp_link):
+            try:
+                os.unlink(tmp_link)
+            except OSError:
+                pass
+        ok, _how = _create_link(tmp_link, vault_path)
+        if ok:
+            try:
+                os.unlink(p)
+                os.replace(tmp_link, p)
+            except OSError:
+                ok = False
+        if os.path.lexists(tmp_link) and not os.path.lexists(p):
+            pass                          # 临时名残留由下次覆盖
         fixed.append((n, ok))
     return fixed
 
@@ -615,6 +635,64 @@ def ingest(cfg: dict, src_vpk: str, mode: str = "move", meta: dict = None) -> di
                  "⚠ 链接不可用，addons 里是独立副本（占双倍空间、不随实体更新）。"
                  "同盘环境下正常不该出现；若出现请检查两处是否在同一分区/NTFS。"),
     }
+
+
+def move_category(cfg: dict, vault_path: str, target_cat: str,
+                  confirm: bool = False) -> dict:
+    """把某个 mod 的 <标题>.workshop 目录移到另一个分类目录。
+
+    自动分类只是起点：用户随时可能觉得「这个明明是武器皮肤」。移动的只是
+    仓库里的目录位置，VPK 内容、元数据、addonlist 条目都不受影响。
+    ⚠️ 符号链接按**路径**指向，目录一移就断 —— 所以移动后要重建链接；
+       硬链接指向 inode，不受影响；副本是独立文件，也不受影响。
+    """
+    vault_path = os.path.abspath(vault_path)
+    ws_dir = os.path.dirname(vault_path)
+    if not ws_dir.endswith(".workshop"):
+        return {"ok": False,
+                "error": "这个 mod 不在 .workshop 结构里（可能是直接放在 addons 下的 VPK），"
+                         "没有仓库分类可移动"}
+    repo_dir = cfg.get("repo_dir", "")
+    if not repo_dir:
+        return {"ok": False, "error": "还没配置 mod 仓库目录"}
+    cur_parent = os.path.dirname(ws_dir)
+    cur_name = os.path.basename(cur_parent)
+    target_name = _repo_category_dir(repo_dir, target_cat)
+    if target_name == cur_name:
+        return {"ok": False, "error": "它已经在这个分类里了（%s）" % cur_name}
+    target_parent = os.path.join(repo_dir, target_name)
+    dst_dir = os.path.join(target_parent, os.path.basename(ws_dir))
+    if os.path.exists(dst_dir):
+        return {"ok": False, "error": "目标分类下已有同名目录，请先处理：%s" % dst_dir}
+
+    info = {"from": cur_name, "to": target_name,
+            "title": os.path.basename(ws_dir)[:-len(".workshop")],
+            "vpk": os.path.basename(vault_path)}
+    if not confirm:
+        return {"ok": False, "need_confirm": True, "plan": info, "count": 1,
+                "warning": "将把「%s」从 %s 移到 %s。VPK 内容与 addonlist 不受影响；"
+                           "符号链接会在移动后自动重建。"
+                           % (info["title"], cur_name, target_name),
+                "items": ["%s  →  %s" % (info["title"], target_name)]}
+
+    addons = paths.addons_dir(cfg)
+    names = link_entries(addons, vault_path)      # 移动前记下指向它的条目
+    try:
+        os.makedirs(target_parent, exist_ok=True)
+        shutil.move(ws_dir, dst_dir)
+    except Exception as ex:
+        return {"ok": False, "error": "移动失败：%s: %s" % (type(ex).__name__, ex)}
+    new_vault = os.path.join(dst_dir, os.path.basename(vault_path))
+    fixed = refresh_links(addons, new_vault, names) if names else []
+    safety.log("move-category", "%s: %s -> %s（重建链接 %d/%d）"
+               % (info["title"], cur_name, target_name,
+                  len([x for x in fixed if x[1]]), len(fixed)))
+    return {"ok": True, "from": cur_name, "to": target_name,
+            "new_path": new_vault, "links": fixed,
+            "links_ok": len([x for x in fixed if x[1]]),
+            "note": (("addons 里 %d 个条目，其中 %d 个需要重建"
+                       % (len(names), len(fixed))) if names
+                      else "addons 里没有指向它的条目")}
 
 
 def _rollback(done: list, ws_dir: str, dst_vpk: str, addons: str, link_name: str) -> list:

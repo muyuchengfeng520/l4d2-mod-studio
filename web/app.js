@@ -190,6 +190,7 @@ const ACT = {
   batchOff: () => doBatch(Object.fromEntries([...S.sel].map(k => [k, false])), '批量停用'),
   batchIsolate: () => batchIsolate(),
   openMod: b => openMod(b.dataset.key),
+  moveCat: b => moveCategory(b.dataset.key),
   refine: b => { S.refineKey = b.dataset.key; S.drop.clear(); switchTab('refine'); },
   /* 组件精修 */
   loadComp: () => { S.refineKey = ($('#modSel') || {}).value || S.refineKey; S.drop.clear(); loadComponents(); },
@@ -1156,6 +1157,19 @@ async function openMod(key) {
       <div class="row" id="modOps"></div>
     </div>`;
   // 操作按钮用 DOM 建、key 走 dataset —— mod.key 是文件名，绝不能拼进内联 handler
+  // 手动调整分类：下拉里列出全部分类（排除当前这个）
+  const cats = S.scan.categories || {};
+  const order = Object.keys(cats).sort((a, b) => (cats[a].order || 99) - (cats[b].order || 99));
+  const sel = el('select', { id: 'moveCatSel', style: 'min-width:150px' });
+  order.filter(k => k !== m.category).forEach(k => {
+    sel.appendChild(el('option', { value: k, text: cats[k].zh + '（' + k + '）' }));
+  });
+  if (order.filter(k => k !== m.category).length) {
+    $('#modOps').append(
+      el('span', { class: 'muted', style: 'margin-left:6px', text: '改分类：' }),
+      sel,
+      el('button', { class: 'btn small', 'data-act': 'moveCat', 'data-key': m.key, text: '移动' }));
+  }
   $('#modOps').append(
     el('button', { class: 'btn primary', 'data-act': 'refine', 'data-key': m.key, text: '去组件精修' }),
     el('button', { class: 'btn', 'data-act': 'reassignFrom', 'data-key': m.key, text: '改模型归属' }),
@@ -2324,4 +2338,26 @@ async function acProbeLink() {
     </div>
     <div class="muted small" style="margin-top:6px">${esc(r.note || '')}</div>
   </div>`;
+}
+
+/* 手动移动 mod 到另一个仓库分类（自动分类只是起点，用户可以改） */
+async function moveCategory(key) {
+  const sel = $('#moveCatSel');
+  if (!sel || !sel.value) { toast('先选一个目标分类'); return; }
+  const cat = sel.value;
+  const pv = await api('/api/mod/move-category', { key, category: cat, confirm: false }, 'POST');
+  if (pv.ok) { toast('已移动'); return; }
+  if (!pv.need_confirm) { toast(pv.error || '移动失败', 'bad'); return; }
+  openConfirm('移动分类', pv, async () => {
+    busy(true, '正在移动…');
+    const r = await api('/api/mod/move-category', { key, category: cat, confirm: true }, 'POST');
+    busy(false);
+    if (r.ok) {
+      toast('已移到 ' + r.to + (r.links_ok ? '（重建链接 ' + r.links_ok + ' 条）' : ''));
+      closeDrawer();
+      loadScan(true);
+    } else {
+      toast(r.error || '移动失败', 'bad');
+    }
+  });
 }
