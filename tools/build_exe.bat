@@ -66,11 +66,15 @@ if exist "%ROOT%\data\taglib\TaggedAssets.jsonc" (
   set "TAGLIB_ARG=--add-data "%ROOT%\data\taglib;data\taglib""
 )
 
+rem --uac-admin: embed a requireAdministrator manifest, same as FireAxe does.
+rem Creating a symlink needs SeCreateSymbolicLinkPrivilege; without elevation the
+rem only options are hardlink (same volume) or copy. FireAxe ships exactly this
+rem manifest, which is why it can make symlinks without any manual setup.
 rem Run PyInstaller via "python -m" instead of the pyinstaller.exe shim:
 rem the shim pip writes hard-codes the venv's absolute path at creation time,
 rem so moving/renaming the project folder silently breaks it (pyinstaller.exe
 rem exits with no output). "python -m PyInstaller" has no such binding.
-"%PY%" -m PyInstaller --noconfirm --clean --onefile --noconsole ^
+"%PY%" -m PyInstaller --noconfirm --clean --onefile --noconsole --uac-admin ^
   --name L4D2ModStudio ^
   --icon "%ROOT%\assets\app.ico" ^
   --paths "%ROOT%" --paths "%ROOT%\app" ^
