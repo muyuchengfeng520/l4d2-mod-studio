@@ -27,8 +27,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import (ai, audit, components, gamefiles, manager, paths, reassign,  # noqa: E402
-                  safety, scan, vpk)
+from core import (__version__, ai, audit, components, gamefiles, manager,  # noqa: E402
+                  paths, reassign, safety, scan, vpk)
 from core import acquire
 
 
@@ -101,6 +101,7 @@ def api_status(ctx: Ctx) -> dict:
     return {
         # 身份签名：新实例启动前靠它判断「端口上跑的是不是自己人」
         "app": "L4D2 Mod Studio",
+        "version": __version__,
         "pid": os.getpid(),
         "port": ctx.port,
         "config": {k: val for k, val in cfg.items() if not k.startswith("_")},
@@ -120,6 +121,7 @@ def api_status(ctx: Ctx) -> dict:
 def api_bootstrap(ctx: Ctx) -> dict:
     ctx.get_cfg()
     return {
+        "version": __version__,
         "config": {k: val for k, val in ctx.state["cfg"].items() if not k.startswith("_")},
         "evidence": ctx.state.get("boot_evidence", {}),
         "candidates": paths.find_candidates(),

@@ -1648,7 +1648,7 @@ function openSettings() {
   $('#drawerBody').insertAdjacentHTML('beforeend', `
     <div class="card" style="margin-top:12px">
       <h3>关于</h3>
-      <div class="muted small">L4D2 Mod Studio · MIT 许可。内置的素材标签库数据
+      <div class="muted small">L4D2 Mod Studio ${(S.boot && S.boot.version) ? 'v' + S.boot.version : ''} · MIT 许可。内置的素材标签库数据
         源自开源项目 NekoVpk（GPL-3.0），以数据形式内联于程序中，与游戏本体无关。</div>
     </div>`);
   openDrawer('设置');
