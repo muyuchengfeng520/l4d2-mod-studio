@@ -231,9 +231,16 @@ def plan_ingest(cfg: dict, src_vpk: str, meta: dict = None) -> dict:
     if not src_vpk.lower().endswith(".vpk"):
         return {"ok": False, "error": "只支持 .vpk 文件（当前: %s）" % os.path.basename(src_vpk)}
     repo_dir = cfg.get("repo_dir", "")
-    if not repo_dir or not os.path.isdir(repo_dir):
-        return {"ok": False,
-                "error": "还没配置 FireAxe 仓库目录（设置页探测或手动填一个）"}
+    if not repo_dir:
+        return {"ok": False, "error": "还没配置 mod 仓库目录（设置页探测或手动填一个）"}
+    if not os.path.isdir(repo_dir):
+        # 配置里有路径 = 用户选定或 bootstrap 给的默认位置 → 首次入库直接建出来，
+        # 不让用户手动 mkdir。建不出来（盘符不存在/无权限）再如实报错。
+        try:
+            os.makedirs(repo_dir, exist_ok=True)
+        except OSError as ex:
+            return {"ok": False,
+                    "error": "仓库目录无法创建: %s（%s）" % (repo_dir, ex)}
 
     try:
         info = inspect_vpk(src_vpk, cfg, meta.get("title", ""))

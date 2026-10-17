@@ -238,6 +238,18 @@ def addonlist_path(cfg: dict) -> str:
     return game_sub(cfg, "addonlist.txt")
 
 
+def default_repo_dir() -> str:
+    """工具自有的默认仓库位置（不依赖 FireAxe 时使用）。
+
+    放在**数据目录的同一级**：与 data/ 一起搬迁，整个文件夹拷走就带走全部模组。
+      * 源码模式：<项目>/mods
+      * exe 模式（同级可写）：<exe 目录>/mods
+      * exe 模式（退到 LOCALAPPDATA）：%LOCALAPPDATA%/L4D2ModStudio/mods
+    目录本身**不在这里创建**：等第一次入库时按需建，避免留一堆空目录。
+    """
+    return os.path.join(os.path.dirname(safety.DATA_DIR), "mods")
+
+
 def autodetect_repo() -> tuple[str, list[str]]:
     """探测 FireAxe 素材仓库，返回 (仓库根, 依据)。
 
@@ -334,6 +346,13 @@ def bootstrap(force: bool = False) -> dict:
         ev["repo_dir"] = e
         if r:
             cfg["repo_dir"], changed = r, True
+        else:
+            # 没有 FireAxe 式仓库也能用：落到工具自有位置，首次入库时创建。
+            # 这样「不装 FireAxe」是完整可用的，不需要用户手动建文件夹。
+            d = default_repo_dir()
+            cfg["repo_dir"], changed = d, True
+            ev["repo_dir"].append(
+                "未找到现有仓库，使用工具默认位置（首次入库时自动创建）: %s" % d)
     else:
         ev["repo_dir"] = ["沿用已保存配置: %s" % cfg["repo_dir"]]
     if not cfg["taglib"] or not os.path.isfile(cfg["taglib"]):
