@@ -687,7 +687,8 @@ def detect_steamcmd() -> str:
         if c == "steamcmd":
             try:
                 r = subprocess.run(["where", "steamcmd"], capture_output=True,
-                                   timeout=10, text=True, errors="replace")
+                                   timeout=10, text=True, errors="replace",
+                                   creationflags=_NO_WIN)
                 if r.returncode == 0 and r.stdout.strip():
                     return r.stdout.splitlines()[0].strip()
             except Exception:
@@ -777,6 +778,12 @@ STEAM_API_DETAILS = ("https://api.steampowered.com/ISteamRemoteStorage/"
                      "GetPublishedFileDetails/v1/")
 
 
+# 无控制台的 exe 调控制台子进程时，Windows 会给子进程新开一个黑窗口。
+# CREATE_NO_WINDOW（0x08000000）让子进程不分配控制台 —— 所有 subprocess
+# 调用都要带它，否则用户会看到 PowerShell/steamcmd 的黑框一闪而过。
+_NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _ps_exe() -> str:
     """挑一个 PowerShell 可执行文件：**优先 pwsh 7**。
 
@@ -798,7 +805,8 @@ def _ps_exe() -> str:
         if c in ("pwsh", "powershell"):
             try:
                 r = subprocess.run(["where", c], capture_output=True, timeout=5,
-                                   text=True, errors="replace")
+                                   text=True, errors="replace",
+                                   creationflags=_NO_WIN)
                 if r.returncode == 0 and r.stdout.strip():
                     return c
             except Exception:
@@ -822,7 +830,8 @@ def _ps_run(script: str, timeout: int = 120) -> tuple:
         r = subprocess.run(
             [_ps_exe(), "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-File", path],
-            capture_output=True, timeout=timeout)
+            capture_output=True, timeout=timeout,
+            creationflags=_NO_WIN)
         raw = r.stdout + r.stderr
         # PowerShell 5.1 的管道输出是**本地代码页（GBK）**，按 utf-8 解会乱码
         # （实测「无法连接到远程服务器」变成一堆 ʹ�á�0����）。先试 utf-8，
@@ -1188,7 +1197,8 @@ def workshop_download(cfg: dict, item_id: str, steamcmd: str = "") -> dict:
                    "+workshop_download_item", STEAM_APP_ID, item_id, "+quit"]
             proc = subprocess.Popen(cmd, cwd=work,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="replace")
+                                    text=True, encoding="utf-8", errors="replace",
+                                    creationflags=_NO_WIN)
             out_lines = []
             for line in proc.stdout:
                 line = line.rstrip()

@@ -270,8 +270,11 @@ def _listener_pid(port: int):
         # ⚠️ 中文 Windows 的 netstat 输出是 GBK；用 text=True 按 UTF-8 解码会抛
         # UnicodeDecodeError。这里直接拿 bytes 再按「替换非法字节」的方式解码，
         # 行内容只认 ASCII 的数字列，所以替换不影响判断。
+        # CREATE_NO_WINDOW：exe 是无控制台的，调 netstat 这种控制台程序
+        # 不指定的话 Windows 会弹一个黑窗口出来（用户视角就是「闪一下」）
         raw = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                             capture_output=True, timeout=8).stdout
+                             capture_output=True, timeout=8,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
         out = raw.decode("utf-8", errors="replace")
         pids = set()
         for line in out.splitlines():
