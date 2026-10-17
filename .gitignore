@@ -1,0 +1,41 @@
+# ============================================================
+#  L4D2 Mod Studio - .gitignore
+#  原则：源码与成品 exe 进库，运行时数据与构建中间产物不进。
+#
+#  ⚠️ 本文件**不随同步脚本更新**（tools/sync_to_github.py 把它排除在白名单外）——
+#     主项目那份是开发用的，本份是发布副本专用的，两边内容不同，各有各的用途。
+# ============================================================
+
+# ---- 运行时数据目录 ----
+# data/ 首次启动自动生成（配置/备份/隔离区/日志），全是本机产物，不进库。
+# 可选的 NekoVpk 标签库（data\taglib\TaggedAssets.jsonc）由用户自行投放，也不进库。
+data/
+
+# ---- 构建中间产物（exe 本身要进库，见下面的白名单）----
+dist/
+.build/venv/
+.build/pyi/
+.build/pyi-cache/
+.build/L4D2ModStudio.spec
+.build/ui_re_out.txt
+.build/ui_reassign_result.json
+.build/diag_out.json
+# 二进制不进仓库：exe 通过 GitHub Releases 分发（见 README「发布」一节）。
+# 早期版本曾把 exe 直接提交进 git，导致 .git 膨胀到 79 MB —— 已用重写历史移除。
+*.exe
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 工具输出 ----
+graphflow-out/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
