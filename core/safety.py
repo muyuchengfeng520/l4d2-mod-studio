@@ -58,7 +58,17 @@ def _work_root() -> str:
     exe 模式优先放在 exe 同级（便携：配置、备份、隔离区跟着 exe 走，
     换台机器拷过去就还在）；万一 exe 被放进 Program Files 这类没写权限的
     地方，就退到 %LOCALAPPDATA%\\L4D2ModStudio。
+
+    环境变量 L4D2MS_WORK_ROOT 可覆盖整个数据根目录（配置/备份/隔离区/日志
+    一起搬走）。加这个口子是为了**测试**：本模块在 import 期就把下面那几个
+    常量算死并 makedirs，于是任何 `import core.safety` 的测试脚本都会把备份
+    和隔离产物写进玩家真实的 data/ —— 想测「备份→还原」就得先污染真实目录，
+    这本身就是隐患。有了这个变量，脚本在 import 之前设成临时目录即可隔离。
+    生产路径不受影响：不设这个变量时行为与原来逐字节相同。
     """
+    override = (os.environ.get("L4D2MS_WORK_ROOT") or "").strip()
+    if override:
+        return os.path.abspath(override)
     if _frozen():
         cands = [os.path.dirname(os.path.abspath(sys.executable))]
         la = os.environ.get("LOCALAPPDATA")
@@ -71,6 +81,10 @@ def _work_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# ⚠️ 下面这组常量在 **import 期**就固定下来，并在最后 makedirs 一次。
+#    也就是说：任何 `import core.safety` 的脚本都会在 import 那一刻就
+#    「认下」一个数据目录并建出来。测试脚本必须先设 L4D2MS_WORK_ROOT
+#    再 import，否则备份/隔离产物会落进玩家真实的 data/（见 _work_root）。
 APP_ROOT = _app_root()          # 只读资源（web/ 等）
 WORK_ROOT = _work_root()        # 可写数据（配置/备份/隔离区/日志）
 DATA_DIR = os.path.join(WORK_ROOT, "data")
@@ -293,7 +307,7 @@ def atomic_copy(src: str, dst: str) -> None:
 # 编码自适应文本读写（addonlist.txt 等玩家手改过的文本文件）
 # --------------------------------------------------------------------------- #
 def encoding_candidates() -> list[str]:
-    """文本文件的编码探测顺序：utf-8-sig → utf-8 → 本地编码。
+    """文本文件的编码探测顺序：utf-8 → 本地编码（GBK 等）。
 
     为什么需要探测：`addonlist.txt` 是玩家手工可编辑的文件，中文 Windows 上
     不少玩家的这份文件是 **GBK** 存的。原实现用 `encoding="utf-8", errors="replace"`
@@ -304,8 +318,18 @@ def encoding_candidates() -> list[str]:
     本机实测：`locale.getpreferredencoding(False)` 在中文 Windows 返回 "cp936"
     （GBK 的别名），所以它排在 gbk 之前；两者 codecs 规范化后是同一个名字，
     会被去重掉，不会重复尝试。
+
+    ⚠️ 这里**故意不含 "utf-8-sig"**。BOM 必须由 read_text_auto 单独判断，原因：
+    `utf-8-sig` 解码器对「开头没有 BOM 的 UTF-8」也能解码成功（只是不剥字节），
+    所以只要把它排进候选表，**任何普通 UTF-8 文件都会被判定成 utf-8-sig**；
+    而写入端用 encoding="utf-8-sig" 时 Python 会**主动在文件最前面加一个 BOM**。
+    读的时候没剥、写的时候硬加 —— 对「BOM 本来就在开头」的文件恰好无损，但对
+    「本来没有 BOM」的文件就是每写一次凭空长 3 字节。
+    真实事故：玩家的 addonlist.txt 表头从 `"AddonList"` 变成了 `"\\ufeff"`，
+    字节从 `22 41 64 64 6F 6E 4C 69 73 74 22` 变成 `22 EF BB BF 22`，
+    而本程序随后每写一次还会再长 3 字节（实测 5763 → 5766）。
     """
-    cands = ["utf-8-sig", "utf-8"]
+    cands = ["utf-8"]
     for enc in (locale.getpreferredencoding(False), "gbk", "mbcs"):
         if not enc:
             continue
@@ -321,7 +345,10 @@ def encoding_candidates() -> list[str]:
 def read_text_auto(path: str) -> tuple[str, str]:
     """读文本文件，自动探测编码。返回 (文本, 实际使用的编码)。
 
-    文件不存在返回 `("", fallback)` —— 调用方据此走「新建」分支。
+    文件不存在返回 `("", "utf-8")` —— 调用方据此走「新建」分支（新建文件一律
+    写 UTF-8 无 BOM，这是跨平台最稳的默认值；**不要**拿候选表最后一项当默认，
+    在中文 Windows 上那是 mbcs/cp936，会把「文件还没建」跟「文件是 GBK」混为一谈）。
+
     编码探测全部失败时退回 fallback + `errors="replace"` 保证不抛，
     但会写一条 WARN 审计日志：这种情况写回去一定会损坏内容，
     必须留下痕迹而不是悄悄进行。
@@ -329,13 +356,25 @@ def read_text_auto(path: str) -> tuple[str, str]:
     cands = encoding_candidates()
     fallback = cands[-1] if cands else "utf-8"
     if not os.path.isfile(path):
-        return "", fallback
+        return "", "utf-8"
     with open(path, "rb") as fp:
         raw = fp.read()
     # 空文件或纯 ASCII：utf-8 即可，不必动本地编码（也避免给纯英文文件
     # 附上 gbk 标签，导致后续写回时多此一举地换编码）
     if not raw:
         return "", "utf-8"
+    # BOM 单独判：只有真的以 EF BB BF 开头，才用 utf-8-sig 读、并把
+    # "utf-8-sig" 作为编码告诉写入端（写入端会**自动补回** BOM，于是逐字节往返）。
+    # 这就是 encoding_candidates 里不能放 utf-8-sig 的原因：它对无 BOM 的
+    # UTF-8 也解码成功，一旦进候选表，所有普通 UTF-8 文件都会被误判成
+    # 「有 BOM」，写回时长出 3 字节 —— 正是玩家 addonlist.txt 被写坏的那种模式。
+    if raw.startswith(codecs.BOM_UTF8):
+        try:
+            return raw.decode("utf-8-sig"), "utf-8-sig"
+        except UnicodeDecodeError:
+            # BOM 后面不是合法 UTF-8：落入下面的候选表按「坏文件」处理，
+            # 让 WARN 日志留下痕迹，而不是在这里悄悄吞掉。
+            pass
     for enc in cands:
         try:
             return raw.decode(enc), enc

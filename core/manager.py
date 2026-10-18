@@ -55,7 +55,8 @@ def read_addonlist_text(path: str) -> str:
     return txt
 
 
-def _render_addonlist(old_text: str, mapping: dict[str, bool]) -> tuple[str, list[str]]:
+def _render_addonlist(old_text: str, mapping: dict[str, bool],
+                      drop: "set[str] | frozenset[str]" = frozenset()) -> tuple[str, list[str]]:
     """逐行改写 addonlist.txt：只替换匹配到的条目行，其余行原样保留。
 
     返回 (新文本, 按出现顺序排列的 .vpk 键列表)。
@@ -63,6 +64,12 @@ def _render_addonlist(old_text: str, mapping: dict[str, bool]) -> tuple[str, lis
     为什么要逐行：原实现是「正则扫出所有 .vpk → 重新拼整个文件」，
     于是注释行、非 .vpk 条目、额外 key、空行全被静默丢弃 ——
     玩家手工加进 addonlist.txt 的东西会凭空消失。
+
+    `drop` = 要**整条删除**的 key（隔离/卸载用）。这是必须单独给的一组，
+    不能靠「从 mapping 里 pop 掉」来表达删除 —— _render_addonlist 只会
+    改写 mapping 里有的条目，不在 mapping 里的条目一律原样保留，
+    于是「pop 掉再写回」等于什么都没删（隔离后 addonlist.txt 里那条还在，
+    游戏仍会尝试加载一个已经不存在于 addons 的文件）。
     """
     keys: list[str] = []
     seen: set[str] = set()
@@ -76,8 +83,15 @@ def _render_addonlist(old_text: str, mapping: dict[str, bool]) -> tuple[str, lis
             continue
         pos = 0
         buf: list[str] = []
+        dropped_here = 0
         for m in ms:
             key = m.group(1)
+            if key in drop:
+                # 整条摘掉：把从本条目起点到终点的整段切走，前后内容保留
+                buf.append(line[pos:m.start()])
+                pos = m.end()
+                dropped_here += 1
+                continue
             if key in mapping:
                 # 命中要改的 key：只换掉 `"0"` / `"1"` 这一段，缩进与行尾不动
                 buf.append(line[pos:m.start(2)])
@@ -87,9 +101,15 @@ def _render_addonlist(old_text: str, mapping: dict[str, bool]) -> tuple[str, lis
                 seen.add(key)
                 keys.append(key)
         buf.append(line[pos:])
-        out.append("".join(buf))
-    # 新增的 key（原文件里没有）：追加到末尾，插在收尾的 `}` 之前
-    extra = [k for k in mapping if k not in seen]
+        new_line = "".join(buf)
+        # 整行只剩缩进和行尾 = 这行除了被摘掉的条目没别的东西了，一起删掉，
+        # 别在文件里留一串空行。
+        if dropped_here and not new_line.strip():
+            continue
+        out.append(new_line)
+    # 新增的 key（原文件里没有）：追加到末尾，插在收尾的 `}` 之前。
+    # drop 里的 key 绝不能进 extra —— 否则刚删掉又原样追加回来了。
+    extra = [k for k in mapping if k not in seen and k not in drop]
     if extra:
         new_lines = ['\t"%s"\t\t"%d"\n' % (k, 1 if mapping[k] else 0) for k in extra]
         insert_at = len(out)
@@ -102,32 +122,51 @@ def _render_addonlist(old_text: str, mapping: dict[str, bool]) -> tuple[str, lis
     return "".join(out), keys
 
 
-def write_addonlist(path: str, mapping: dict[str, bool], backup: bool = True) -> dict:
+def write_addonlist(path: str, mapping: dict[str, bool], backup: bool = True,
+                    drop: "set[str] | frozenset[str]" = frozenset()) -> dict:
     """把 {文件名: 启用} 写回 addonlist.txt。
 
     保持原有条目顺序（顺序影响加载优先级），新增的追加到末尾；
     非 .vpk 的行（注释、额外 key、空行）逐行原样保留。
     写回时用探测到的编码，避免把 GBK 文件强行转成 UTF-8。
+
+    `drop` = 要从表里**整条删除**的 key（隔离/卸载）。必须显式传进来：
+    只把 key 从 mapping 里去掉是删不掉的（见 _render_addonlist 的说明）。
     """
     with _ADDONLIST_LOCK:
         old_text, enc = _read_addonlist_bytes(path)
-        if not old_text and not os.path.isfile(path):
+        # ⚠️ 判据是「读到的文本是空的」，不是「文件不存在」。
+        #    原写法 `if not old_text and not os.path.isfile(path)` 只在文件
+        #    缺失时补骨架；文件**存在但为空**（0 字节，玩家误删/编辑器存空、
+        #    或上次写到一半断电）时既不补骨架、_render_addonlist 又找不到
+        #    收尾的 `}` 去插新条目，于是新增条目被追加到文件末尾，写出来是
+        #    光秃秃的 `\t"x.vpk"\t\t"1"\n` —— 没有 "AddonList" 标题、没有大括号，
+        #    游戏解析不了，玩家看到的是「开了一个 mod，游戏里却一个都没有」。
+        if not old_text.strip():
             old_text = '"AddonList"\n{\n}\n'
-        new_text, keys = _render_addonlist(old_text, mapping)
+        new_text, keys = _render_addonlist(old_text, mapping, drop=drop)
 
         bkp = ""
         if backup and os.path.isfile(path):
             bkp = safety.backup_file(path, tag="addonlist")
         safety.atomic_write_text(path, new_text, encoding=enc)
-        safety.log("addonlist-write", "%s（%d 条，启用 %d，编码 %s）备份=%s"
-                   % (path, len(keys), sum(1 for v in mapping.values() if v), enc, bkp))
+        safety.log("addonlist-write", "%s（%d 条，启用 %d，删除 %d，编码 %s）备份=%s"
+                   % (path, len(keys), sum(1 for v in mapping.values() if v),
+                      len(drop), enc, bkp))
         return {"path": path, "backup": bkp, "count": len(keys),
                 "enabled": sum(1 for v in mapping.values() if v),
+                "dropped": len(drop),
                 "text": new_text, "encoding": enc}
 
 
 def set_enabled(addonlist: str, changes: dict[str, bool]) -> dict:
     """changes = {mod 文件名: 是否启用}。"""
+    # ⚠️ 空 changes 直接回失败：下面 `res["ok"] = True` 是无条件的，而
+    #    write_addonlist 会把「一个键都没有」的表写回去 —— 等于用空改动
+    #    触发一次纯备份 + 重写。上层（app/api.py 的 api_enable）只在这里
+    #    拿到 ok=True 才回写内存，空输入根本不该走到那一步。
+    if not changes:
+        return {"ok": False, "error": "没有需要改的条目（changes 为空）"}
     if len(changes) > BATCH_LIMIT:
         return {"ok": False, "error": "单批最多 %d 项，本批 %d 项；请分批执行"
                                       % (BATCH_LIMIT, len(changes))}
@@ -157,7 +196,12 @@ def batch_by_mods(addonlist: str, mods: list[dict], enable: bool) -> dict:
     `pending_blocks` = 因前面失败而未执行的块数。
     """
     results = []
-    keys = [m["key"] for m in mods]
+    # ⚠️ 去重：同一个 key 在一批里出现两次（前端把两个勾选项算重）时，
+    #    第一次写入成功、第二次再写一次同样的值 —— 表面无害，但 `count`
+    #    会虚高（报了 12 项、实际只有 10 个 mod），失败计数也会错位。
+    #    调用方本来就不该重复传。
+    seen = set()
+    keys = [m["key"] for m in mods if not (m["key"] in seen or seen.add(m["key"]))]
     for i in range(0, len(keys), BATCH_LIMIT):
         chunk = keys[i:i + BATCH_LIMIT]
         r = set_enabled(addonlist, {k: enable for k in chunk})
@@ -165,10 +209,15 @@ def batch_by_mods(addonlist: str, mods: list[dict], enable: bool) -> dict:
         if not r.get("ok"):
             break          # 前面已经改了文件，继续跑只会让状态更乱；如实上报
     applied = sum(1 for r in results if r.get("ok"))
+    # ⚠️ keys 为空时循环一次都没跑、results 为空，而 all([]) 恒为 True ——
+    #    原写法会把「一个 mod 都没传」报成成功，前端于是弹一句绿色的
+    #    「已完成 0 项」。空输入必须当成失败并给出原因。
     total = (len(keys) + BATCH_LIMIT - 1) // BATCH_LIMIT
-    out = {"ok": all(r.get("ok") for r in results), "batches": len(results),
-           "count": len(keys), "detail": results,
+    out = {"ok": bool(results) and all(r.get("ok") for r in results),
+           "batches": len(results), "count": len(keys), "detail": results,
            "applied_blocks": applied, "pending_blocks": total - len(results)}
+    if not keys:
+        out["error"] = "没有可操作的 mod（列表为空）"
     if not out["ok"] and applied:
         out["partial"] = ("前 %d 块已写入 addonlist.txt 并生效，第 %d 块失败；"
                           "剩余 %d 块未执行（未自动回滚，请核对后重试）"
@@ -190,24 +239,50 @@ def isolate_mods(addonlist: str, mods: list[dict], isolate_repo: bool = True) ->
       * isolate_repo=True  —— 连仓库里的 .workshop 目录一起搬走（彻底腾空间）
       * isolate_repo=False —— 只删掉 addons 里的链接（保留仓库素材，随时可再链接）
     无论哪种，都先把 mod 从 addonlist 里摘掉，保证游戏不会残留垃圾条目。
+
+    返回键：ok / moved / failed / partial / dangling / rolled_back / backup / remaining。
+    `ok=False` **不代表什么都没动**，调用方必须看 moved 与 failed 分别报数。
     """
     if len(mods) > BATCH_LIMIT:
         return {"ok": False, "error": "单批最多 %d 项，本批 %d 项" % (BATCH_LIMIT, len(mods))}
+    # 把「读 addonlist → 逐个搬文件 → 写回 addonlist」整段放进锁里：
+    # 原先 read 在锁外、write 时才进锁，于是「隔离」与「开关」并发时会各自
+    # 读到同一份旧表，后写的把先写的抹掉（丢更新）。搬文件这一步也一并被锁
+    # 覆盖，是为了让 addonlist 的改动顺序与文件的实际去向严格一致 ——
+    # 否则「文件已搬走、条目还没摘掉」的中间态会被另一个请求读到并写进表里。
+    # RLock 可重入：write_addonlist 内部还要再拿同一把锁。
+    with _ADDONLIST_LOCK:
+        return _isolate_mods_locked(addonlist, mods, isolate_repo)
+
+
+def _isolate_mods_locked(addonlist: str, mods: list[dict], isolate_repo: bool) -> dict:
+    """isolate_mods 的实现体。**调用方必须已持有 _ADDONLIST_LOCK。**"""
     mapping = scan.read_addonlist(addonlist)
     # dangling：目标已搬走、但 addons 里的链接没能删掉（清理失败）。
     # 这些是留在玩家 addons 目录里的断链，必须回传给界面提示手动处理，
     # 不能像原先那样吞掉 —— 用户会以为「已经隔离干净了」。
     moved, failed, dangling = [], [], []
+    removed_keys: set[str] = set()      # 只有**真搬成功**的 key 才配从 addonlist 摘掉
     for m in mods:
         try:
             key = m["key"]
             addon_path = m["addon_path"]
-            if os.path.islink(addon_path) or os.path.isfile(addon_path):
+            if os.path.islink(addon_path) or os.path.isfile(addon_path) \
+                    or (not os.path.isdir(addon_path) and os.path.lexists(addon_path)):
+                # 第三种情况是**断链**：符号链接指向的目标已经不在（Steam 更新
+                # 改了路径 / 仓库目录被手动挪走 / 隔离过一次又手动还原了一半），
+                # 而链接文件本身还躺在 addons 里 —— 玩家看得见它，游戏却加载
+                # 不到。os.path.isfile 对断链为 False、os.path.isdir 也为 False，
+                # 旧写法会让它掉进最后的 else 被报成「找不到实体文件」，
+                # 于是这种最该清理的东西反倒清不掉。
                 if isolate_repo and m.get("repo_dir") and os.path.isdir(m["repo_dir"]):
                     dst = safety.isolate(m["repo_dir"], tag="mod")
-                    # 链接会随目标一起失效，顺手清掉悬挂链接
+                    # 链接会随目标一起失效，顺手清掉。这里**不能**沿用原来的
+                    # os.path.islink 判断：目标刚被上一句搬走，此刻链接已经是断链，
+                    # islink 在 Windows 上可能返回 False，而真正要问的是
+                    # 「这个路径还在不在」—— 那是 lexists。
                     try:
-                        if os.path.islink(addon_path):
+                        if os.path.lexists(addon_path):
                             os.unlink(addon_path)
                     except OSError as ex:
                         # 这里静默 pass 的后果很具体：目标已被搬进隔离区，
@@ -226,15 +301,41 @@ def isolate_mods(addonlist: str, mods: list[dict], isolate_repo: bool = True) ->
             elif os.path.isdir(addon_path):
                 dst = safety.isolate(addon_path, tag="dir")
                 moved.append({"key": key, "moved": dst, "original": addon_path})
-            mapping.pop(key, None)
+            else:
+                # 三支都没命中 = 扫描之后文件已经不在了（游戏更新改了路径 /
+                # 玩家自己删了 / 被别的程序挪走）。这**不是**「没有变化」，
+                # 也不该安静跳过 —— 用户勾了它、点了隔离，结果只在界面上
+                # 看到一句「已隔离 N 项」，少掉的那一个没有任何解释。
+                # 记进 failed，让界面按 key 逐个报出来。
+                failed.append({"key": key,
+                               "error": "找不到实体文件（可能已被移动或删除）：%s"
+                                        % addon_path})
+                safety.log("isolate", "找不到实体文件，已跳过 %s（%s）"
+                           % (key, addon_path), level="WARN", ok=False)
+                continue
+            # ⚠️ 只有走到这里（三支里有一支确实搬了东西）才算「这个 mod 被搬走了」。
+            #    原先这条 pop 无条件执行：既不是链接/文件也不是目录时（文件已被
+            #    手动删除、或扫描后被 Steam 更新改了路径），它照样把 key 从
+            #    addonlist.txt 里摘掉 —— 条目没了、文件其实还在别处，玩家看到的是
+            #    「我明明没隔离它，addonlist 里却消失了」。
+            removed_keys.add(key)
         except Exception as ex:
             failed.append({"key": m.get("key"), "error": str(ex)})
             safety.log("isolate", "%s 失败: %s" % (m.get("key"), ex), level="ERROR", ok=False)
-    # 写 addonlist 失败时必须回滚 —— 否则 mod 已经搬进隔离区、addonlist 里却
-    # 还留着启用条目，玩家看到的是「条目在、文件没了」。原实现直接让异常冲出
-    # 函数，隔离区里躺着一堆 mod，界面却什么都没说。
+    # ⚠️ 这里**不能**只靠「mapping.pop(key) 再写回」来表达删除 ——
+    #    _render_addonlist 只改写在 mapping 里的条目，不在 mapping 里的条目
+    #    一律原样保留；于是 pop 掉再写回等于什么都没删（隔离后 addonlist.txt
+    #    里那条还在，游戏仍会尝试加载一个已经不在 addons 里的文件）。
+    #    真正删除必须走 drop 参数，由 _render_addonlist 整段摘除。
+    #    mapping 这边也一并 pop：让返回的 count/enabled 反映「剩下多少条」，
+    #    否则删掉的条目还会被算进统计里。
+    #    写 addonlist 失败时必须回滚 —— 否则 mod 已经搬进隔离区、addonlist 里却
+    #    还留着启用条目，玩家看到的是「条目在、文件没了」。原实现直接让异常冲出
+    #    函数，隔离区里躺着一堆 mod，界面却什么都没说。
+    for key in removed_keys:
+        mapping.pop(key, None)
     try:
-        res = write_addonlist(addonlist, mapping)
+        res = write_addonlist(addonlist, mapping, drop=removed_keys)
     except Exception as ex:                                   # noqa: BLE001
         rolled_back = _rollback_moved(moved)
         safety.log("isolate", "写 addonlist 失败，已回滚 %d/%d 项: %s"
@@ -251,7 +352,17 @@ def isolate_mods(addonlist: str, mods: list[dict], isolate_repo: bool = True) ->
     if dangling:
         safety.log("isolate", "有 %d 个链接未能删除，留在 addons 里成了断链：%s"
                    % (len(dangling), "、".join(dangling[:5])), level="WARN", ok=False)
-    return {"ok": not failed, "moved": moved, "failed": failed, "rolled_back": False,
+    # 三种结局要能分开看，不能一律压成 ok=False：
+    #   ① moved 非空 + failed 空  → 全成功，ok=True
+    #   ② moved 非空 + failed 非空 → **部分成功**：这几项真搬进隔离区了、
+    #      addonlist 里也真摘掉了。ok=False 只表示「不是全部成功」，
+    #      界面必须按 moved.length 提示「已隔离 N 项、M 项失败」，
+    #      否则用户看到一句「失败」就以为什么都没动（文件其实已经不在了）。
+    #   ③ moved 空   + failed 非空 → 全失败，addonlist 未改动
+    # 「传了 keys 却一个都没搬成」也归 ②/③ 而非成功：原先 ok=True 会让界面
+    # 弹「N 项已移入隔离区」，而那 N 项压根没找到实体。
+    return {"ok": not failed and bool(moved), "moved": moved, "failed": failed,
+            "partial": bool(moved) and bool(failed), "rolled_back": False,
             "dangling": dangling,
             "backup": res["backup"], "remaining": res["count"]}
 
@@ -306,7 +417,14 @@ def restore_from_staging(addonlist: str, item_path: str, target_dir: str | None 
         return {"ok": False, "error": "隔离区条目不存在"}
     org = safety.read_origin(item_path)
     real = org.get("original_name") or "restored_item"
-    dst_dir = (target_dir or "").strip() or org.get("original_dir", "")
+    # ⚠️ 边车（safety.isolate 写的 *.origin.json）里只有 original_path，**没有**
+    #    original_dir 这个键 —— 它是 safety.list_staging() 读列表时现算出来给
+    #    前端看的。原先这里直接 `org.get("original_dir", "")`，于是从列表里点
+    #    「还原」、前端把算好的 original_dir 原样传回来时才不触发 need_target；
+    #    任何直接调本函数（或先清空输入框）的路径都会永远拿到「没有留下原始
+    #    位置」，明明边车里记着完整路径。改成从 original_path 取 dirname。
+    orig = org.get("original_path") or ""
+    dst_dir = (target_dir or "").strip() or (os.path.dirname(orig) if orig else "")
     if not dst_dir:
         return {"ok": True, "need_target": True, "name": real,
                 "hint": "这条记录没有留下原始位置，请手动指定还原目录"}

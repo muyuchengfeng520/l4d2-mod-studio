@@ -65,9 +65,18 @@ def load() -> dict:
                    % (bad_path, type(ex).__name__, ex), level="ERROR", ok=False)
         return cfg
     if not isinstance(data, dict):
+        # 顶层不是对象（比如有人把它改成了 `[...]` 或 `"abc"`）同样是「内容坏了」，
+        # 必须和上面 except 分支一样**保留现场**再忽略：否则 bootstrap() 一旦
+        # 认为配置需要改写，save() 就会把这唯一一份手改内容原地覆盖掉，
+        # 事后连「原来写的是什么」都查不到。
+        bad_path = CONFIG_PATH + ".bad"
+        try:
+            shutil.copy2(CONFIG_PATH, bad_path)
+        except Exception:
+            bad_path = "(备份失败)"
         _LAST_LOAD_CORRUPT = True
-        safety.log("config-corrupt", "config.json 顶层不是对象（实际是 %s），已忽略"
-                   % type(data).__name__, level="ERROR", ok=False)
+        safety.log("config-corrupt", "config.json 顶层不是对象（实际是 %s），已保留原文件到 %s"
+                   % (type(data).__name__, bad_path), level="ERROR", ok=False)
         return cfg
     # 只接受已知键，且值必须是字符串：手改配置写成 null / 数字时不该让下游炸掉。
     for k in DEFAULT:

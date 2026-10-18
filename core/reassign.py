@@ -116,6 +116,12 @@ def detect(vpk_path: str) -> dict:
 
     # 内部指向：读本体 mdl，看它 include 了谁的 anim / gestures
     internal, internal_refs = "", []
+    # ⚠️ 这里失败不能静默吞掉：internal 读不出来时 mismatch 恒为 False，
+    #    界面只会显示「内部指向：未能判断」，用户无法区分
+    #    ①「这个 mod 本来就没写内部引用」和 ②「文件读坏了 / 分卷缺失」。
+    #    ②是真实故障（VPK 不完整），却伪装成了正常结论。
+    #    所以把异常文本留在 internal_error 里，由 api/前端如实展示。
+    internal_error = ""
     body_mdl = "%s/%s.mdl" % (BODY_DIR, BY_ID[cur]["body"])
     if body_mdl in paths_:
         try:
@@ -129,8 +135,8 @@ def detect(vpk_path: str) -> dict:
                             internal_refs.append(s)
                             if not internal:
                                 internal = cand["id"]
-        except Exception:
-            pass
+        except Exception as ex:
+            internal_error = "%s: %s" % (type(ex).__name__, ex)
 
     return {
         "ok": True,
@@ -144,6 +150,7 @@ def detect(vpk_path: str) -> dict:
         "internal": internal,
         "internal_zh": BY_ID[internal]["zh"] if internal else "",
         "internal_refs": internal_refs,
+        "internal_error": internal_error,
         "mismatch": bool(internal and internal != cur),
         "arm_files": sorted(p for _i, p in arm_hit),
         "panel_files": sorted(p for _i, p in panel_hit),
@@ -195,6 +202,10 @@ def plan(vpk_path: str, target: str, fix_internal: bool = True) -> dict:
 
     # 内部引用：只能**等长**字节替换。MDL 内部有偏移表，长度一变就毁结构。
     internal_plan = []
+    # 同 detect()：读不出 mdl 时不能静默 pass。用户勾了「一并修正内部引用」，
+    # 结果 internal_plan 是空的，界面会显示成「没有需要改的内部引用」——
+    # 而真相是「读失败了」。两者必须区分，否则用户会以为修好了。
+    internal_error = d.get("internal_error", "")
     body_mdl = "%s/%s.mdl" % (BODY_DIR, cur["body"])
     if fix_internal and body_mdl in paths_:
         try:
@@ -213,8 +224,8 @@ def plan(vpk_path: str, target: str, fix_internal: bool = True) -> dict:
                             "why": "" if len(old) == len(new)
                                    else "%s(%d) 与 %s(%d) 长度不同，等长替换做不到，跳过"
                                         % (cand_id, len(cand_id), target, len(target))})
-        except Exception:
-            pass
+        except Exception as ex:
+            internal_error = "%s: %s" % (type(ex).__name__, ex)
 
     return {
         "ok": True,
@@ -223,6 +234,7 @@ def plan(vpk_path: str, target: str, fix_internal: bool = True) -> dict:
         "to": {"id": tgt["id"], "zh": tgt["zh"]},
         "current": d["current"], "current_zh": d["current_zh"],
         "internal": d["internal"], "internal_zh": d["internal_zh"],
+        "internal_error": internal_error,
         "mismatch": d["mismatch"],
         "total": len(paths_),
         "renames": renames,
@@ -300,11 +312,12 @@ def apply(vpk_path: str, out_path: str, target: str, fix_internal: bool = True) 
                         internal_applied.append(old_b.decode())
                 if new_data != e.data:
                     e.data = new_data
-                    # ⚠️ write_vpk 是直接把 e.crc 写进目录树的（vpk.py 第 524 行），
-                    #    **不会重算**。改了内容却留着旧 crc，成品就是「元数据与内容不符」
-                    #    的坏文件 —— strip_vpk 从不改 data 所以没这个问题，这里必须补。
-                    #    crc 的口径是 full_data（preload + data），与 strip_vpk 的
-                    #    期望摘要算法保持一致。
+                    # crc 口径是 full_data（preload + data），与 strip_vpk 的
+                    # 期望摘要算法一致。
+                    # 注：write_vpk 现在**自己会按写出的字节重算 crc**（vpk.py 的
+                    # write_vpk 里那句 `e.crc = crc32(preload, crc32(data))`），
+                    # 所以这行已不是必需品；保留它是为了让「改过的条目一定是新
+                    # crc」这件事在本函数里自证，不依赖下游实现细节。
                     e.crc = zlib.crc32(e.full_data) & 0xFFFFFFFF
         keep.append(e)
 

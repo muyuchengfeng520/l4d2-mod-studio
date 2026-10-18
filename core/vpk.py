@@ -504,11 +504,33 @@ def write_vpk(out_path: str, entries: list[VpkEntry], version: int = 1) -> None:
             "首个是 %s（应载入 %d 字节）。请先用 Vpk(..., load_data=True) "
             "或 load_all() 读取。" % (len(lifeless), e0.vpath, e0.entry_length))
 
-    data_blob = bytearray()
+    # 数据区拼接：**先累加长度算偏移，再一次性 join**。
+    # 原写法 `data_blob = bytearray(); data_blob += e.data` 在 CPython 上看似摊还
+    # 便宜，但每个条目都要把已累积的全部字节重新分配/拷贝一次（真正的增量是
+    # 条目大小，而发生次数是 O(条目数)）——对 800MB 级、几万个条目的 mod 意味着
+    # 十几 GB 量级的无谓拷贝。改成 b"".join 只需两趟线性扫描，峰值内存只多出
+    # 「所有数据的一份副本」（与原实现下 bytearray 的最终大小相当）。
+    total = 0
     for e in entries:
-        e.entry_offset = len(data_blob)
-        data_blob += e.data
+        e.entry_offset = total
+        # ⚠️ 必须用 len(e.data)，不能写 len(e.full_data)：entry_length 描述的是
+        #    「数据区里的字节数」，preload 字节是**存在目录树里**的，不在数据区。
+        #    用 full_data 会让每个条目的长度多出 preload_len，偏移虽自洽，
+        #    成品却比真实数据整体偏长，读到最后一个条目时直接越过 EOF。
+        #    （crc 按完整内容（preload + data）重算，见下方那句 —— 不能沿用旧的。）
         e.entry_length = len(e.data)
+        # ⚠️ crc 必须按**这次真正写进去的内容**重算（preload + data）。
+        #    前一句注释说「crc 仍按完整内容算，那是对的」—— 那只在「调用方
+        #    刚解析完同一个文件、byte 级原样重写」时成立。而 strip_vpk 会
+        #    先 load_all 再原样重写、components 那条路径也会改条目集合；
+        #    任何修改过 e.data 的场景，沿用的旧 crc 都会与写出的字节不符，
+        #    成品「能解析、能读」，校验却对不上 —— 属于最难查的那类问题。
+        #    反过来，输入来自真实 VPK 时重算结果与旧值一致（全仓库无改 crc
+        #    的写入点），所以对正常路径零影响。
+        e.crc = zlib.crc32(e.preload, zlib.crc32(e.data)) & 0xFFFFFFFF
+        total += e.entry_length
+    data_blob = b"".join(e.data for e in entries)
+    for e in entries:
         e.archive_index = ARCHIVE_IN_DIR
 
     def s(x: str) -> bytes:

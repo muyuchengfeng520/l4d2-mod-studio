@@ -51,7 +51,9 @@ def main():
                 time.sleep(0.5)
 
             # 从 mod 详情跳过来（顺便验证抽屉入口）
-            js("S.re.key=(window.S.mods&&S.mods[0]&&S.mods[0].key)||''; switchTab('reassign')")
+            # key 动态取已扫到的第一个 mod，不写死某个真实 mod 名 ——
+            # .build/ 会被同步进公开仓库，写死会让敏感扫描中止同步
+            js("S.re.key=(window.S.scan&&S.scan.mods&&S.scan.mods[0]&&S.scan.mods[0].key)||''; switchTab('reassign')")
             for _ in range(60):
                 if js("!!document.querySelector('#reBox .card')"):
                     break

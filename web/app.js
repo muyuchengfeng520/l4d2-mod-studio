@@ -115,9 +115,20 @@ function toast(msg, kind = '') {
    ③ HTTP 非 2xx 时，后端返回的仍是 {ok:false,error,detail}（_err），能解析就用它，
       解析不出才补一个「HTTP xxx」；不改任何字段名，不因 !r.ok 抛错（否则读不到 error）。 */
 const API_TIMEOUT = 60000;
+/* ⚠️ 这里漏写过会导致「正常的长任务被前端掐断」（踩坑）：服务端还有两条**同步阻塞**
+   的接口，它们的耗时只取决于网络/用户手速，与代码无关 ——
+     /api/acquire/workshop 是同步的（core/acquire.py 的 workshop_download 在探测到
+       SteamCMD 通道不可用时会直接转 workshop_download_direct，整个过程同步跑完才返回，
+       实测可达 DOWNLOAD_TIMEOUT=900 秒）；
+     /api/pick-file 要等用户在系统对话框里选文件（服务端 join 最多 180 秒）。
+   漏掉的后果是前端 60 秒就 abort，而服务端还在继续写盘 —— 用户看到「请求超时」，
+   后台却真的把 mod 下完/入库了，两边状态对不上。 */
 const API_SLOW = ['/api/scan', '/api/rescan', '/api/audit', '/api/vpk/', '/api/ai/', '/api/isolate',
                   '/api/staging/', '/api/gamefiles/replace', '/api/gamefiles/restore',
-                  '/api/gamefiles/write', '/api/pick-file', '/api/open-folder', '/api/config'];
+                  '/api/gamefiles/write', '/api/gamefiles/restore-all',
+                  '/api/pick-file', '/api/open-folder', '/api/config',
+                  '/api/acquire/workshop', '/api/acquire/ingest',
+                  '/api/acquire/install', '/api/reassign/apply'];
 async function api(path, body, method = 'GET') {
   const opt = { method };
   // GET 不带 Content-Type：没有请求体时它没有任何意义，只是白白多一个头。
@@ -733,14 +744,29 @@ async function doBatch(changes, label) {
     for (let i = 0; i < keys.length; i += per) {
       const chunk = {}; keys.slice(i, i + per).forEach(k => chunk[k] = changes[k]);
       const r = await api('/api/enable', { changes: chunk }, 'POST');
-      if (!r.ok) { failed = '第 ' + (batch + 1) + ' 批失败：' + r.error; break; }
+      if (!r.ok) {
+        // ⚠️ 后端是**逐块提交、不整体回滚**的（core/manager.py 的 batch_by_mods）：
+        //    它把「哪几块已写进 addonlist.txt」放在 applied_blocks 里回传。
+        //    原写法一旦 r.ok 为假就整块丢弃，界面上开关保持着「没变」，
+        //    而磁盘上的 addonlist.txt 其实已经被改了前半部分 —— 用户关掉再开
+        //    才发现状态全乱了。这里把后端确认已生效的块如实累加进 applied。
+        if (r.applied_blocks) {
+          Object.assign(applied, chunk);
+          done += Object.keys(chunk).length; batch++;
+        }
+        failed = '第 ' + (batch + 1) + ' 批失败：' + (r.error || r.warning || '未知原因');
+        break;
+      }
       Object.assign(applied, chunk);
       done += Object.keys(chunk).length; batch++;
     }
   } finally {
     busy(false);
   }
-  S.scan.mods.forEach(m => { if (m.key in applied) m.enabled = applied[m.key]; });
+  // S.scan 在首次扫描完成前是 null（未打开「浏览」页也可能从别的入口调到这里）
+  if (S.scan && Array.isArray(S.scan.mods)) {
+    S.scan.mods.forEach(m => { if (m.key in applied) m.enabled = applied[m.key]; });
+  }
   // 成功的那些从已选里摘掉；失败的留着，用户可以直接重试
   Object.keys(applied).forEach(k => S.sel.delete(k));
   syncSelState();
@@ -761,18 +787,38 @@ async function batchIsolate() {
   if (!keys.length) { toast('没有选中任何 mod', 'bad'); return; }
   if (S.busy) { toast('上一个操作还没完成', 'bad'); return; }
   const pv = await api('/api/isolate', { keys }, 'POST');
-  // 后端「超限」错误里也带 need_confirm:True（app/api.py 的 api_isolate），
-  // 所以必须先看 error —— 否则会拿一个失败响应当确认框弹出来，用户点下去还是失败。
-  if (pv.error) { toast(pv.error, 'bad'); return; }
-  if (!pv.need_confirm) { toast('无法执行', 'bad'); return; }
+  // 判据是「服务端要不要我先确认」，不是「有没有 error」：
+  // 「超限」这类 400 响应恰好也带 need_confirm:true，所以不能只看 error；
+  // 反过来，真正的失败响应不该被当成确认框弹出来（用户点下去还是失败）。
+  if (!pv.need_confirm) { toast(pv.error || '无法执行', 'bad'); return; }
   openConfirm('移入隔离区', pv, async (opts) => {
     busy(true, '正在移入隔离区…');
     const r = await api('/api/isolate', { keys, confirm: true, isolate_repo: opts }, 'POST');
     busy(false);
-    if (!r.ok) { toast(r.error, 'bad'); return; }
-    S.sel.clear();
-    toast(`${r.moved.length} 项已移入隔离区（可随时还原）`, 'ok');
-    closeDrawer(); await loadScan(true);
+    /* ⚠️ 不能再用「if (!r.ok) 一句报错就 return」了（踩坑记录）：
+       后端 manager.isolate_mods 返回的 ok=False 只表示「不是全部成功」——
+       部分失败时 moved 里那几项**已经真的搬进隔离区、addonlist 也真摘掉了**。
+       原写法会让界面既不刷新列表、也不提「已搬走几项」，用户看到「失败」
+       就以为什么都没动，接着手动去 addons 里找，结果发现文件不见了。
+       现在的规矩：只要 moved 非空就必须刷新 + 如实报数，剩余的 failed 逐条列出。 */
+    const movedN = (r.moved || []).length;
+    const failedN = (r.failed || []).length;
+    const danglingN = (r.dangling || []).length;
+    if (movedN) {
+      /* 已搬走的从选择集里摘掉；失败的留着，用户可以直接重试（与 doBatch 同一套语义） */
+      (r.moved || []).forEach(m => { if (m && m.key) S.sel.delete(m.key); });
+      syncSelState();
+      if (failedN) {
+        const why = (r.failed || []).map(f => f.key + ': ' + (f.error || '未知原因')).join('；');
+        toast(`已隔离 ${movedN} 项，${failedN} 项失败（${why}）`, 'bad');
+      } else {
+        toast(`${movedN} 项已移入隔离区（可随时还原）`, 'ok');
+      }
+      closeDrawer(); await loadScan(true);
+    } else {
+      toast(r.error || '没有可隔离的条目（可能已被移动或删除）', 'bad');
+    }
+    if (danglingN) toast(`另有 ${danglingN} 个链接未能删除，需手动清理`, 'bad');
   });
 }
 
@@ -868,6 +914,10 @@ function reBody() {
           : '<span class="muted">未能判断</span>'}</div>
       </div>
       ${warn}
+      ${d.internal_error ? `<div class="note bad">
+        <b>⚠ 读不出模型内部的动画引用</b>：<span class="mono small">${esc(d.internal_error)}</span><br>
+        这不代表它没写内部引用 —— 可能是 VPK 里 <span class="mono">${esc('models/survivors/' + (d.current || '') + '.mdl')}</span>
+        读坏了或分卷缺失。「内部指向」与下方「归类冲突」的判断暂不可信，建议先重新下载/校验这个 mod。</div>` : ''}
       ${(d.internal_refs && d.internal_refs.length)
         ? `<div class="muted" style="margin-top:8px">内部引用的动画文件：${d.internal_refs.map(esc).join('　')}</div>` : ''}
     </div>
@@ -1207,10 +1257,24 @@ async function isolateOne(key) {
     busy(true, '正在移入隔离区…');
     const r = await api('/api/isolate', { keys: [key], confirm: true, isolate_repo: isolateRepo }, 'POST');
     busy(false);
-    if (!r.ok) { toast(r.error, 'bad'); return; }
-    S.sel.clear();
-    toast('已移入隔离区（可随时还原）', 'ok');
-    await loadScan(true);
+    // ⚠️ 与批量版同一个道理：后端是「部分成功」语义（见 core/manager.py
+    //    isolate_mods 的返回值说明），按 ok 一刀切会把「其实已经搬走、
+    //    只是 addonlist 写入失败」的情况报成一句含糊的 error。
+    //    这里先按 moved 计数判断，再决定要不要报错。
+    const movedN = (r.moved || []).length;
+    const failedN = (r.failed || []).length;
+    if (movedN > 0) {
+      // 只把**这一个** key 从已选里摘掉。原写法 S.sel.clear() 会顺手把用户
+      // 之前勾的其他几十个 mod 也一起清掉（在详情抽屉里点单个隔离尤其明显），
+      // 想再操作其它项就得重新一个个勾回来。
+      S.sel.delete(key);
+      syncSelState();
+      if (failedN) toast(`已移入隔离区，但另有 ${failedN} 项失败：${(r.failed[0] || {}).error || ''}`, 'bad');
+      else toast('已移入隔离区（可随时还原）', 'ok');
+      await loadScan(true);
+      return;
+    }
+    toast(r.error || (r.failed && r.failed[0] && r.failed[0].error) || '移入隔离区失败', 'bad');
   }, '内容会完整保留在隔离区，addonlist.txt 里的条目会被摘除。');
 }
 
@@ -1225,19 +1289,37 @@ async function rAudit() {
   const a = S.audit;
   if (!a || !a.conflicts) { v.innerHTML = `<div class="note bad">审计失败：${esc(a?.error || '未知')}</div>`; return; }
   const c = a.conflicts, rd = a.redundancy, p = a.prerequisites, u = a.unlinked;
-  const auditTotal = c.path_count + rd.total_findings + p.total + u.total;
-  const nav = $('#navAudit'); if (nav) nav.textContent = auditTotal;
+  // 脚本库整包冲突会直接崩游戏，单列一路。旧接口返回里没这个字段时退化成空集，不报错。
+  const sl = a.script_lib || { groups: [], total: 0, note: '' };
+  const auditTotal = c.path_count + rd.total_findings + p.total + u.total + sl.total;
+  const nav = $('#navAudit');
+  if (nav) {
+    nav.textContent = auditTotal;
+    // 徽标只能放一个数字，但这几项单位不同（处 / 条 / 项），直接相加是"混着加"。
+    // 所以把逐项明细挂到 title 上：数字仍旧是合计，悬停就能看清它是怎么来的。
+    nav.title = [`脚本库冲突 ${sl.total} 处`, `覆盖冲突 ${c.path_count} 条`,
+                 `多余异常 ${rd.total_findings} 项`, `前置缺失 ${p.total} 条`,
+                 `未接入 ${u.total} 项`].join('\n');
+  }
 
-  const tabs = [['conflicts', '覆盖冲突', c.path_count], ['redundancy', '多余与异常', rd.total_findings],
+  const tabs = [['scriptlib', '脚本库冲突', sl.total], ['conflicts', '覆盖冲突', c.path_count],
+                ['redundancy', '多余与异常', rd.total_findings],
                 ['prereq', '前置缺失', p.total], ['unlinked', '未接入', u.total]];
   let body = '';
-  if (S.auditTab === 'conflicts') body = auditConflicts(c);
+  if (S.auditTab === 'scriptlib') body = auditScriptLib(sl);
+  else if (S.auditTab === 'conflicts') body = auditConflicts(c);
   else if (S.auditTab === 'redundancy') body = auditRedundancy(rd);
   else if (S.auditTab === 'prereq') body = auditPrereq(p);
   else body = auditUnlinked(u);
 
-  v.innerHTML = `<h2>冲突与缺失</h2>
-    <div class="lead">覆盖冲突 ${c.path_count} 条 · 多余异常 ${rd.total_findings} 项 · 前置缺失 ${p.total} 条 · 未接入 ${u.total} 项</div>
+  // 致命项必须顶在最前面：否则它会被 453 条贴图覆盖冲突彻底淹没，而它才是唯一会让人进不去游戏的
+  const fatalBanner = sl.total
+    ? `<div class="note bad">警告：检出 ${sl.total} 处<b>脚本库整包冲突</b>。同一套脚本库被两个 mod 各提供一份，
+       版本打架会让游戏<b>进图即崩</b>（崩溃点常见于 vscript.dll / tier0.dll）。处理办法见「脚本库冲突」页。</div>`
+    : '';
+
+  v.innerHTML = `<h2>冲突与缺失</h2>${fatalBanner}
+    <div class="lead">脚本库冲突 ${sl.total} 处 · 覆盖冲突 ${c.path_count} 条 · 多余异常 ${rd.total_findings} 项 · 前置缺失 ${p.total} 条 · 未接入 ${u.total} 项</div>
     <div class="subtabs">
       ${tabs.map(([k, zh, n]) => `<span class="chip ${S.auditTab === k ? 'on' : ''}" data-act="setAuditTab" data-t="${k}">${zh}<span class="c">${n}</span></span>`).join('')}
       <div class="spacer" style="flex:1"></div>
@@ -1246,6 +1328,44 @@ async function rAudit() {
   applyBusy();
   // 切回本页时，如果后台还有复核任务在跑，把轮询接上
   if (S.auditTab === 'conflicts' && S.ai.job && S.ai.job.state === 'running') aiPoll(S.ai.job.id);
+}
+
+/* 脚本库整包冲突页 —— 致命级：会崩游戏，与普通覆盖冲突不是一回事 */
+function auditScriptLib(sl) {
+  if (!sl.total) {
+    return `
+      <div class="note">没有发现脚本库整包冲突。</div>
+      <div class="card">
+        <h3>这一项查的是什么 <span class="tagline">为什么它比普通覆盖冲突严重得多</span></h3>
+        <div class="muted">
+          <p>普通覆盖冲突（两个 mod 改了同一张贴图）只是「哪个生效」的问题，最坏的结果是白装。</p>
+          <p>但同一<span class="mono">脚本库目录</span>下多个 <span class="mono">.nut</span> 被同一组 mod
+             同时提供，意味着<b>两个不同版本的库被拼在一起跑</b>：引擎只加载其中一份，
+             其余脚本却按另一份的语义调用，极易形成无限递归把 VScript 的调用栈撑爆 ——
+             表现为<b>进图加载脚本的瞬间崩溃</b>，崩溃点常见于
+             <span class="mono">vscript.dll</span>，内存先耗尽时表现为
+             <span class="mono">tier0.dll</span>（同一根因）。</p>
+          <p>官方允许每个 addon 各带一份的入口脚本
+             （<span class="mono">director_base_addon / scriptedmode_addon / mapspawn_addon</span>）
+             已排除，不计入此项。</p>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="note bad">以下 ${sl.total} 处必须处理，否则进图可能直接崩溃。</div>
+    ${sl.groups.map(g => `
+      <div class="card">
+        <h3><span class="pill">${esc(g.severity)}</span> <span class="mono">${esc(g.dir)}</span>
+            <span class="tagline">${g.file_count} 个文件 · ${g.mods.length} 个 mod</span></h3>
+        <div class="muted">${esc(g.why)}</div>
+        <div class="muted" style="margin-top:6px"><b>怎么修：</b>${esc(g.fix)}</div>
+        <table style="margin-top:8px">
+          <tr><th style="width:220px">涉及 mod（二选一，只留一个）</th></tr>
+          ${g.mods.map(m => `<tr><td class="mono small">${esc(m)}</td></tr>`).join('')}
+        </table>
+        <div class="mono small" style="margin-top:6px">共同提供：${g.files.map(f => esc(f.split('/').pop())).join(' · ')}</div>
+      </div>`).join('')}
+    <div class="note">${esc(sl.note)}</div>`;
 }
 
 /* 冲突页 */
@@ -1322,6 +1442,13 @@ function auditPrereq(p) {
   const byKind = {};
   p.findings.forEach(f => (byKind[f.kind] ||= []).push(f));
   return `<div class="note">比对基准：${esc(p.checked_against)}。只有「已启用」的 mod 参与检查。</div>` +
+    // ⚠️ 后端给了 game_files_ok 却从没显示过：false 意味着这次没读到游戏自带资源，
+    //    「模型缺件 / 脚本依赖缺失」的置信度已被后端统一打折成「低」——
+    //    用户得知道这个前提，否则会把一堆「低」当成系统抽风。
+    (p.game_files_ok === false
+      ? `<div class="note bad">⚠ 本次<b>没能读到游戏自带资源</b>（游戏目录未设置，或 pak01_dir.vpk 解析失败）。
+         「模型缺件 / 脚本依赖缺失」两类的判断缺少对照基准，已自动降为低置信度 —— 请勿据此删除 mod。</div>`
+      : '') +
     (Object.keys(byKind).length ? Object.entries(byKind).map(([k, arr]) => `<div class="card">
       <h3>${esc(k)} <span class="tagline">${arr.length} 项</span></h3>
       <div class="tblwrap" style="max-height:320px"><table>
@@ -2181,6 +2308,9 @@ async function acPick() {
     S.ac.plan = null;
     const box = $('#acPlanBox');
     if (box) box.innerHTML = '';
+  } else if (r.cancelled) {
+    // 用户自己点了「取消」——不是错误，不该弹红色提示
+    return;
   } else if (r.error) {
     toast(r.error);
   }
@@ -2292,6 +2422,16 @@ async function acJobPoll(id) {
         toast('下载并入库完成');
         loadScan(true);
       }
+    } else if (S.ac.job && S.ac.job.state === 'cancelled') {
+      // 取消**不是**「完成」也不是「失败」。原先只认 done，用户点取消后
+      // 后端把 state 置成 "cancelled"，前端于是不再轮询、也不再提示 ——
+      // 界面停在「进行中」的转圈上，看起来像没点中。这里补一条明确收尾。
+      toast('任务已取消');
+    } else if (S.ac.job && S.ac.job.state === 'failed') {
+      // 同理：失败的那次下载原先一句提示都没有（结果卡片里虽有 error，
+      // 但用户得自己往下滚）。直接把后端 result.error 弹出来。
+      const why = (S.ac.job.result && S.ac.job.result.error) || '未知原因';
+      toast('下载失败：' + why, 'bad');
     }
   };
   tick();
@@ -2300,8 +2440,16 @@ async function acJobPoll(id) {
 async function acCancel() {
   const j = S.ac.job;
   if (!j) return;
-  await api('/api/acquire/cancel', { id: j.id }, 'POST');
-  toast('已取消（SteamCMD 进程可能还在跑完当前 item，产物不会入库）');
+  const r = await api('/api/acquire/cancel', { id: j.id }, 'POST');
+  // 后端取消可能是「任务已结束，无法取消」—— 原先把这句话吞掉、照样弹「已取消」，
+  // 用户以为停了，其实还在跑。
+  if (!r.ok) { toast(r.error || '取消失败', 'bad'); return; }
+  // 取消成功后**必须立刻停轮询**：否则要等下一次 tick 才看到 state=cancelled，
+  // 期间界面还在转圈，用户会以为没点中而再点一次。
+  if (S.ac.timer) { clearTimeout(S.ac.timer); S.ac.timer = null; }
+  if (S.ac.job) S.ac.job.state = 'cancelled';
+  if (S.ac.sub === 'ws' && $('#acJobBox')) $('#acJobBox').innerHTML = acJobBody(S.ac.job);
+  toast('已取消（子进程已终止，产物不会入库）');
 }
 
 /* 一键安装 SteamCMD：先拿知情确认文案，用户点头才真下 */

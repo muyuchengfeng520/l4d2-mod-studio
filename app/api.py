@@ -103,6 +103,9 @@ def api_status(ctx: Ctx) -> dict:
         "app": "L4D2 Mod Studio",
         "version": __version__,
         "pid": os.getpid(),
+        # 实例启动时刻：/api/status 不带它的话，两个连起来的 GET 无法判断中间
+        # 是不是换了个实例（端口被重启后接管时，界面还指着旧进程的状态）。
+        "started_at": ctx.state.get("started_at", 0),
         "port": ctx.port,
         "config": {k: val for k, val in cfg.items() if not k.startswith("_")},
         "game_valid": v,
@@ -235,8 +238,11 @@ def api_enable(ctx: Ctx) -> dict:
         wanted = dict(changes)
     elif b.get("keys"):
         enable = bool(b.get("enable"))
-        res = manager.batch_by_mods(al, [{"key": k} for k in b["keys"]], enable)
-        wanted = {k: enable for k in b["keys"]}
+        keys = list(b["keys"])
+        res = manager.batch_by_mods(al, [{"key": k} for k in keys], enable)
+        # batch_by_mods 内部已经对 key 去重，这里同样去重，两边计数才对齐
+        # （原写法直接用原始 keys，重复项会让内存回写数与「已完成 N 项」虚高）。
+        wanted = {k: enable for k in keys}
     elif b.get("category"):
         enable = bool(b.get("enable"))
         mods = [m.to_json() for m in (ctx.state.get("mods") or [])]
@@ -245,7 +251,17 @@ def api_enable(ctx: Ctx) -> dict:
     else:
         return {"ok": False, "error": "参数不足"}
     # 开关状态变了 → 刷新内存中的记录（三个分支共用）
-    if res.get("ok") and wanted:
+    # ⚠️ 判据是「文件到底改没改」，不是「ok 是不是 True」（踩坑记录）：
+    #    batch_by_mods 是**逐块提交、不整体回滚**的，第 3 块失败时前 2 块
+    #    已经把 addonlist.txt 改掉了，此时看 ok=False 就不回写内存，界面上的
+    #    开关会停留在旧状态，与磁盘上的 addonlist 不一致，直到下次 /api/scan。
+    #    `wrote` 里那两个条件也必须分开看：set_enabled 返回的 res 根本没有
+    #    applied_blocks 这个键（`"applied_blocks" not in res` 区分两条路径），
+    #    不能写成 res.get("applied_blocks", res.get("ok")) —— 那样会把
+    #    「没这个键」误判成「没写」。
+    wrote = bool(res.get("applied_blocks")) or (
+        res.get("ok") and "applied_blocks" not in res)
+    if wrote and wanted:
         for m in ctx.state.get("mods") or []:
             if m.key in wanted:
                 m.enabled = bool(wanted[m.key])
@@ -254,6 +270,9 @@ def api_enable(ctx: Ctx) -> dict:
                 d["enabled"] = bool(wanted[d["key"]])
         if ctx.state.get("last_scan"):
             ctx.state["last_scan"]["mods_json"] = [x.to_json() for x in ctx.state["mods"]]
+    if res.get("partial"):
+        # 部分成功必须让界面看得见（原先这个字段核心层给了，前端却从不显示）
+        res["warning"] = res["partial"]
     return res
 
 
@@ -286,7 +305,20 @@ def api_isolate(ctx: Ctx) -> dict:
     mods = [idx[k].to_json() for k in keys if k in idx]
     if not mods:
         return {"ok": False, "error": "选中的 mod 不存在"}
-    return manager.isolate_mods(al, mods, isolate_repo=bool(b.get("isolate_repo", True)))
+    # 没找到实体（扫描之后被手动删了 / Steam 更新改了路径）的 key 也要如实回传，
+    # 否则前端会以为「全都处理完了」。放到 failed 里，让界面能逐条报出来。
+    missing = [{"key": k, "error": "找不到这个 mod 的实体文件（可能已被移动或删除）"}
+               for k in keys if k not in idx]
+    res = manager.isolate_mods(al, mods, isolate_repo=bool(b.get("isolate_repo", True)))
+    if missing:
+        res["failed"] = (res.get("failed") or []) + missing
+        res["ok"] = bool(res.get("moved")) and len(res["failed"]) == 0
+        res["partial"] = bool(res.get("moved"))
+    if not res.get("moved") and not res.get("failed"):
+        # 全都没搬也没报错（keys 与 mods 非空却一个都没处理）—— 界面不能沉默
+        res["ok"] = False
+        res["error"] = res.get("error") or "没有移动任何条目（全部被跳过）"
+    return res
 
 
 # --------------------------------------------------------------------------- #
@@ -700,7 +732,16 @@ def api_pick_file(ctx: Ctx) -> dict:
     if "error" in result:
         return {"ok": False, "error": result["error"]}
     if not result.get("path"):
-        return {"ok": False, "error": "未选择文件（或对话框超时）"}
+        # ⚠️ 两种完全不同的情况曾经共用一句话（「未选择文件（或对话框超时）」）：
+        #    ① 用户在对话框里点了「取消」—— 正常操作；
+        #    ② 180 秒后对话框还开着（用户根本没回来）—— 线程还活着，
+        #       对话窗口仍然浮在桌面上，下一个请求又会再弹一个。
+        #    现在分开报，并且超时时明确告诉用户那个窗口还在。
+        if t.is_alive():
+            return {"ok": False, "timeout": True,
+                    "error": "等待选择文件超时（180 秒），对话框可能还开在桌面上；"
+                             "关掉它再重试，或直接手动填写路径"}
+        return {"ok": False, "cancelled": True, "error": "未选择文件"}
     return {"ok": True, "path": result["path"]}
 
 

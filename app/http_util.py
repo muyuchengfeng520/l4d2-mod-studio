@@ -157,7 +157,23 @@ def check_json_post(h) -> str:
 # 接收
 # --------------------------------------------------------------------------- #
 def read_body(h) -> dict:
-    n = int(h.headers.get("Content-Length") or 0)
+    # ⚠️ Content-Length 是**客户端给的任意字符串**，不是保证成形的数字。
+    #    原写法 `int(h.headers.get("Content-Length") or 0)` 遇到 "abc"、
+    #    "10, 10"（多值被拼成逗号串）、"12abc" 都会抛 ValueError，
+    #    一路冒到 _dispatch 的 except 变成 500「服务端异常」——
+    #    这是**客户端的错**，该回 400，而且 500 会把 traceback 写进日志、
+    #    让排障时误以为是服务端 bug。
+    #    BodyTooLarge 的 413 分支同理：先把「不是数字」挡在门外。
+    try:
+        n = int(h.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        # 回 400 而不是静默当空体、更不是抛异常：
+        # 这一层的错误语义是「已经自己回好响应了」，调用方（_dispatch）看到
+        # BodyTooLarge 只会静默收尾。若在这里 raise，等于把**已经发出的 400**
+        # 变成「服务端异常」，traceback 照样进日志 —— 正是要避免的那种误导。
+        send_err(h, "Content-Length 不是合法整数", 400)
+        h.close_connection = True      # 体没读走，连接不能再复用
+        return {}
     if not n:
         return {}
     if n > MAX_BODY:
@@ -168,10 +184,33 @@ def read_body(h) -> dict:
         h.close_connection = True
         raise BodyTooLarge(n)
     raw = h.rfile.read(n)
+    # ⚠️ socket 的 read(n) **不保证读满 n 个字节**（连接中途断开、前端 abort、
+    #    代理提前关闭都会只给一半）。原写法直接 json.loads，短读时拿到截断的
+    #    JSON → 解析失败 → 静默返回 {} → 接口回「参数不足」，调用方（前端）
+    #    完全不知道是传输被截断了，排障时会怀疑自己的参数写错。
+    #    这里补读满；补不齐就当成客户端断连，走和 _dispatch 里同样的静默路径。
+    if len(raw) < n:
+        rest = b""
+        try:
+            rest = h.rfile.read(n - len(raw))
+        except Exception:                                   # noqa: BLE001
+            rest = b""
+        raw = raw + rest
+        if len(raw) < n:
+            # 短读 = 客户端断连/前半截没送完。已经发过 4xx 的场景在更上面处理，
+            # 这里没有响应可发，只能静默收尾；但 **不能** 抛 BodyTooLarge，
+            # 否则 _dispatch 的「静默」分支之外还会多写一条 ERROR 级日志。
+            h.close_connection = True
+            return {}
     try:
-        return json.loads(raw.decode("utf-8"))
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
         return {}
+    # ⚠️ 必须确认是 JSON **对象**：`json.loads("[1,2]")` / `json.loads("5")` 都能成功，
+    #    返回的却是 list / int。原实现原样交给调用方，接着 `body.get(...)`
+    #    抛 AttributeError → 500。前端只会发对象，所以非对象一律按「空体」处理，
+    #    各接口既有的「参数不足」分支会正常回 400 级错误。
+    return body if isinstance(body, dict) else {}
 
 
 # --------------------------------------------------------------------------- #

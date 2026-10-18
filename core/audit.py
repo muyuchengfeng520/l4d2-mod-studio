@@ -37,8 +37,30 @@ CONFLICT_IGNORE = re.compile(
 # 只有 .mdl + .ani 的纯动画模型，本来就不带 .vvd/.vtx —— 别当成缺件误报
 ANIM_ONLY = re.compile(r"(^|/)(anim_|gestures?_|wip_|p_|z_)|_anims?\.", re.I)
 
+# 官方设计允许「每个 addon 各带一份」的入口脚本：引擎会遍历所有 addon 依次调用，
+# 重复不是冲突。不排除的话，冲突列表会被 director_base_addon.nut 这类噪声淹没
+# （2026-10-18 实测：本机 16 个 mod 各带一份，scriptedmode_addon 3 份）。
+#
+# ⚠️ 这条规则**只属于 script_lib_conflicts()**（脚本库整包冲突的判据），
+#    不许放进 is_noise() —— 见下面 is_noise 的说明。
+MULTI_ADDON_ENTRY = re.compile(
+    r"(^|/)(director_base_addon|scriptedmode_addon|mapspawn_addon)\.nut$", re.I)
+
+# 同一脚本库目录下至少这么多 .nut 被同一组 mod 同时提供，才判为「库整包冲突」。
+# 设成 2 的依据：单文件覆盖只是谁生效的问题，>=2 才说明是两套库被拼在一起。
+LIB_CONFLICT_MIN_FILES = 2
+
 
 def is_noise(p: str) -> bool:
+    """conflicts() 专用的噪声过滤：只排除「人人都有、覆盖也无害」的资源。
+
+    ⚠️ 不许把别的功能的判据塞进来（踩坑，2026-10-18）：
+       曾把 MULTI_ADDON_ENTRY（脚本库检测用的「入口脚本排除」）加在这里，
+       而 conflicts() 与本函数共用 —— 结果覆盖冲突数从 455 掉到 453，
+       对用户就是「之前有的 2 条冲突凭空消失了」，还很难看出原因。
+       各功能的过滤规则必须待在自己的函数里：共用函数的输出不允许被顺手改。
+       入口脚本的排除已下沉到 script_lib_conflicts() 内部（见该函数）。
+    """
     return bool(CONFLICT_IGNORE.search(p))
 
 
@@ -92,7 +114,12 @@ def conflicts(mods: list[dict], only_enabled: bool = True) -> dict:
     pair: dict[tuple[str, str], set] = defaultdict(set)
     truncated = False
     for p, ks in groups.items():
-        if len(pair) > PAIR_CAP:
+        # ⚠️ 上限要在**每处理一组之前**判，而不是处理完一整组之后：原写法
+        #    只在外层循环开头查一次，一个组里若有 1000 个 mod 提供同一文件，
+        #    光这一组就是 C(1000,2)=499500 个组合 —— 判到的时候钱已经花了。
+        #    改成「本组组合数 + 已有数」超限就直接停，并且如实标记 truncated。
+        n_new = len(ks) * (len(ks) - 1) // 2
+        if n_new and len(pair) + n_new > PAIR_CAP:
             truncated = True
             break
         for a, b in combinations(ks, 2):
@@ -143,6 +170,67 @@ def conflicts(mods: list[dict], only_enabled: bool = True) -> dict:
         "note": ("同一条内部资源被多个 mod 提供时，游戏只会用其中一个，"
                  "具体哪个生效取决于加载顺序 —— 没生效的那个就是白装。"
                  "已自动排除 addonimage/sound.cache 这类「人人都有、覆盖也无害」的文件。"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 1.5) 脚本库整包冲突（致命级，会崩游戏）
+# --------------------------------------------------------------------------- #
+def script_lib_conflicts(mods: list[dict], only_enabled: bool = True) -> dict:
+    """两套同名脚本库同时挂载 → 版本打架 → 进图即崩。
+
+    与 conflicts() 的区别（2026-10-18 实测留档，本机真事故）：
+      单文件覆盖只是「哪个生效」的问题，最坏是白装；
+      但同一**脚本库目录**下多个 .nut 被同一组 mod 同时提供，意味着两个不同版本的
+      库被拼在一起跑 —— 引擎只加载其中一份，其余脚本按另一份的语义调用，
+      极易形成无限递归，把 VScript 的调用栈撑爆。
+      崩溃点常见为 `vscript.dll+…`，内存先耗尽时表现为 `tier0.dll+…`（同一根因）。
+
+    事故原型：Thirdperson 与 VSLib 本体同时提供 scripts/vscripts/vslib 下 10 个 .nut
+    （含主入口 vslib.nut），`::Update` 与 `ModeUpdate` 互相调用 → 70 万层栈 → 进图必崩。
+    """
+    owners: dict[str, set] = defaultdict(set)
+    for m in mods:
+        if only_enabled and not m.get("enabled"):
+            continue
+        for p in m.get("_vpaths") or ():
+            if p.endswith(".nut") and not MULTI_ADDON_ENTRY.search(p):
+                owners[p].add(m["key"])
+
+    shared = {p: ks for p, ks in owners.items() if len(ks) > 1}
+
+    # 按「目录 + 共同提供的那组 mod」聚合；不同 mod 组合算不同的冲突，
+    # 免得 A/B 冲突和 A/C 冲突被混成一条说不清。
+    agg: dict[tuple, dict] = {}
+    for p, ks in shared.items():
+        d = p.rsplit("/", 1)[0] if "/" in p else "(根目录)"
+        e = agg.setdefault((d, frozenset(ks)), {"dir": d, "mods": set(ks), "files": []})
+        e["files"].append(p)
+
+    groups = []
+    for e in agg.values():          # 这里只用 e；agg 的键 (目录, mod 组合) 只做去重
+        if len(e["files"]) < LIB_CONFLICT_MIN_FILES:
+            continue
+        groups.append({
+            "dir": e["dir"],        # 目录名存在 e 里，别再依赖外层循环变量
+            "files": sorted(e["files"]),
+            "file_count": len(e["files"]),
+            "mods": sorted(e["mods"]),
+            "severity": "致命",
+            "why": ("同一脚本库目录下 %d 个 .nut 被 %d 个 mod 同时提供 —— 两个版本的库"
+                    "被拼在一起用，进图加载脚本即崩（vscript.dll / tier0.dll）"
+                    % (len(e["files"]), len(e["mods"]))),
+            "fix": "这几项二选一：只保留提供该库的那一个，其余禁用"
+                   "（改 addons 里符号链接后缀为 .vpk.disabled，可逆）",
+        })
+    groups.sort(key=lambda x: -x["file_count"])
+
+    return {
+        "groups": groups,
+        "total": len(groups),
+        "note": ("只统计同一目录下被同一组 mod 同时提供的 .nut。"
+                 "director_base_addon / scriptedmode_addon / mapspawn_addon "
+                 "是官方允许每个 addon 各带一份的入口脚本，已排除。"),
     }
 
 
@@ -268,6 +356,12 @@ def prerequisites(mods: list[dict], game_dir: str, max_scan_bytes: int = 8 * 102
     seen: set[tuple[str, str]] = set()
 
     def emit(kind: str, m: dict, detail: str, confidence: str = "高"):
+        # 游戏本体没读成时，A（模型缺件）与 B（脚本依赖缺失）这两类判据的
+        # 对照基准是残缺的 —— 结论必然偏严，一律降级为「低」，别让用户按
+        # 高置信度去删 mod。
+        if kind in ("模型缺件", "脚本依赖缺失") and not game_ok:
+            confidence = "低"
+            detail += "（⚠ 本次没能读到游戏自带资源，可能只是游戏提供了这一件）"
         sig = (m["key"], kind + detail.split("——")[0][:60])
         if sig in seen:
             return
@@ -300,6 +394,9 @@ def prerequisites(mods: list[dict], game_dir: str, max_scan_bytes: int = 8 * 102
         if m.get("enabled"):
             all_mod_paths |= ps
     available = game_paths | all_mod_paths
+    # ⚠️ 游戏本体解析失败（game_paths 为空集）时，「缺件」判据就失去了对照基准：
+    #    所有 .nut 依赖、所有模型配套件都会被判成缺失。此时必须给结论打折。
+    game_ok = os.path.isfile(pak) and bool(game_paths)
     # 关键：按「无扩展名的 stem」建索引，才能判断 .mdl 有没有配套的 .vvd/.vtx
     avail_stems = {re.sub(r"\.(dx90|dx80|dx70|sw)$", "", p.rsplit(".", 1)[0].lower())
                    for p in available}
@@ -329,6 +426,19 @@ def prerequisites(mods: list[dict], game_dir: str, max_scan_bytes: int = 8 * 102
                 stem = p[:-4]
                 if ANIM_ONLY.search(stem):
                     continue      # 纯动画骨架模型，本来就只有 .mdl + .ani
+                # 结构性判据：同目录存在**同名 .ani** 的 .mdl 一定是纯动画模型。
+                # 动画 mod 的实际布局是「xxx.mdl + xxx.ani」，.mdl 只是个挂载壳，
+                # 几何数据本来就不该有 —— 拿 .vvd/.vtx 去要求它必然是误报。
+                # 为什么不能只靠上面的正则：真实语料（206 mod / 当前 62 条前置发现）
+                # 实测 16 条「模型缺件」里 6 条是这种壳（bill/coach/ellis/nick/
+                # rochelle/zoey 的 slot_023，路径形如 models/xdreanims/xxx.mdl，
+                # 既不含 anim_ 也不含 _anims，正则抓不到）。
+                # 游戏本体同样印证：3333 个 .mdl 里有 31 个没有 .vvd，其中 30 个
+                # 都带 .ani —— 也就是说「缺 .vvd」本身不代表坏件。
+                # .ani 查全局（本 mod + 游戏 + 其他已启用 mod）：动画壳与 .ani
+                # 被拆进两个 mod 的情况也存在，只看本 mod 会漏。
+                if (stem.lower() + ".ani") in available:
+                    continue
                 bare = stem.lower()
                 has_vvd = (bare + ".vvd") in avail_stems or (bare + ".vvd") in available
                 has_vtx = any((bare + e) in available for e in
@@ -400,6 +510,8 @@ def prerequisites(mods: list[dict], game_dir: str, max_scan_bytes: int = 8 * 102
         "findings_truncated": len(findings) > FINDING_CAP,
         "checked_against": "游戏本体 %d 个资源 + 已启用 mod %d 个资源"
                            % (len(game_paths), len(all_mod_paths)),
+        # 给界面用：false 表示这次「缺件」类结论不可全信（游戏本体没读成）。
+        "game_files_ok": game_ok,
     }
 
 
@@ -431,9 +543,17 @@ def unlinked_repo_items(repo_dir: str, mods: list[dict]) -> dict:
 def run_all(mods: list[dict], game_dir: str, addons_dir: str,
             addonlist_map: dict[str, bool], repo_dir: str = "") -> dict:
     c = conflicts(mods, only_enabled=True)
+    sl = script_lib_conflicts(mods, only_enabled=True)
     r = redundancy(mods, addons_dir, addonlist_map)
     p = prerequisites(mods, game_dir)
     u = unlinked_repo_items(repo_dir, mods)
-    safety.log("audit", "冲突 %d 组 / 冗余 %d 项 / 前置 %d 条 / 未接入 %d"
-               % (c["path_count"], r["total_findings"], p["total"], u["total"]))
-    return {"conflicts": c, "redundancy": r, "prerequisites": p, "unlinked": u}
+    if sl["total"]:
+        # 这类会直接崩游戏，日志里必须单独喊一声，不能混在普通冲突数里
+        safety.log("audit", "⚠ 脚本库整包冲突 %d 处，进图可能直接崩：%s"
+                   % (sl["total"], "、".join(g["dir"] for g in sl["groups"][:3])),
+                   level="WARN", ok=False)
+    safety.log("audit", "冲突 %d 组 / 脚本库冲突 %d 处 / 冗余 %d 项 / 前置 %d 条 / 未接入 %d"
+               % (c["path_count"], sl["total"], r["total_findings"], p["total"], u["total"]))
+    # 新增 script_lib 键；原有 4 个键名与内容一字未改，前端不读就不受影响。
+    return {"conflicts": c, "script_lib": sl,
+            "redundancy": r, "prerequisites": p, "unlinked": u}

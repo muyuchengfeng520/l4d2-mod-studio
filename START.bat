@@ -39,6 +39,15 @@ echo  (keep this window open; closing it stops the app)
 echo.
 rem  %* forwards args, e.g.  START.bat --port 17247   (when the default port is taken)
 %PYEXE% "%~dp0app\server.py" %*
+set "RC=%errorlevel%"
 echo.
-echo  Server stopped.
+rem  Exit code 3 means: an instance of this app is ALREADY running on the port,
+rem  so this window did not start a new server. Saying "Server stopped." there is
+rem  what used to confuse people (they thought the thing they just started died).
+if "%RC%"=="3" (
+  echo  Nothing was started - an instance is already running.
+  echo  Switch to the window that is already open, or close this one.
+) else (
+  echo  Server stopped.
+)
 pause

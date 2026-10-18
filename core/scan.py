@@ -89,10 +89,11 @@ def read_addonlist(path: str) -> dict[str, bool]:
     # errors="replace" 变成 U+FFFD（不可逆的 替换字符）。玩家那边看到的是
     # 「扫描认不出我的 mod」，更糟的是 manager.write_addonlist 写回时若沿用
     # 这条路径，就会把 U+FFFD **写回磁盘**，中文文件名被永久改坏。
-    # 现在读走 safety.read_text_auto（候选 ['utf-8-sig','utf-8','gbk','mbcs']，
-    # 探测到的编码原样交给 manager 写回用），读到的名字和写回的名字保证一致。
-    # 实测本机 addonlist.txt（5797 字节，全 ASCII）：探测结果 utf-8-sig，
-    # 条目数 207、启用 207，与旧实现逐键相等 —— 即这次改动在真实语料上零差异。
+    # 现在读走 safety.read_text_auto（它先看文件是否真以 EF BB BF 开头来决定
+    # 要不要用 utf-8-sig，没有 BOM 就按 utf-8 读，探测到的编码原样交给 manager
+    # 写回用），读到的名字和写回的名字保证一致。
+    # 实测本机 addonlist.txt：探测结果 utf-8（该文件没有前置 BOM），条目数与
+    # 启用数与旧实现逐键相等 —— 即这次改动在真实语料上零差异。
     txt, _enc = safety.read_text_auto(path)
     for m in re.finditer(r'"([^"]+\.vpk)"\s*"([01])"', txt):
         out[m.group(1)] = (m.group(2) == "1")

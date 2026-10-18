@@ -49,7 +49,9 @@ WEB = safety.resource("web")
 PORT = 17246
 HOST = "127.0.0.1"
 
-STATE: dict = {"cfg": None, "taglib": None, "last_scan": None, "mods": None}
+STATE: dict = {"cfg": None, "taglib": None, "last_scan": None, "mods": None,
+               # 进程启动时刻（秒）：/api/status 里回传，前端据此识别「实例被换了」
+               "started_at": time.time()}
 LOCK = threading.Lock()
 
 
@@ -183,6 +185,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(out)
         except http_util.BodyTooLarge:
             # 413 已经在 read_body 里发回去了，这里只是别让它变成 500
+            return None
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 前端超时/关页面时会主动断开（web/app.js 用 AbortController 中止）。
+            # ⚠️ 这不是「服务端异常」：原先它会掉进下面的通用分支，把
+            #    traceback.format_exc() 几百行写进 audit.log，一天就把轮转文件
+            #    刷满，真正该看的错误反被挤掉。断开就是断开，不再回任何东西。
             return None
         except Exception as ex:
             return self._err("服务端异常", 500, "%s\n%s" % (ex, traceback.format_exc()))
@@ -339,7 +347,12 @@ def main():
         _sep()
         if "--no-browser" not in sys.argv:
             webbrowser.open(url)
-        return 0
+        # 用专门的退出码 3 表示「没启动，但已有实例在跑」。
+        # ⚠️ 原来回 0：START.bat 里紧跟的 `echo Server stopped.` + `pause`
+        #    会让用户以为**刚启动的**服务已经停了，而真正在跑的是上一个实例
+        #    （PID 在上面那几行里，很容易被滚屏冲掉）。桌面版 desktop.py 也靠
+        #    返回值区分「新起的」和「复用的」。
+        return 3
     if kind == "other":
         return _port_busy(PORT, "该端口上的服务不响应本工具的 /api/status，不是本程序")
 

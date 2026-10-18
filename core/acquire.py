@@ -310,12 +310,22 @@ def _create_link(link_path: str, target: str) -> tuple[bool, str]:
     ok = _verify_link(link_path, target)
     if ok:
         return True, "符号链接"
-    # 标准库不行 → Windows 原生 API（带 ALLOW_UNPRIVILEGED_CREATE 标志）
+    # 标准库不行 → Windows 原生 API（带 ALLOW_UNPRIVILEGED_CREATE 标志 0x2）
     if not os.path.lexists(link_path):
-        try:
-            ctypes.windll.kernel32.CreateSymbolicLinkW(link_path, target, 0x2)
-        except Exception:
-            pass
+        def _call():
+            # 同 _create_hardlink：必须这次调用现场取 WinDLL(use_last_error=True)，
+            # 才能在失败时读到真实错误码（windll 那个恒返回 0）。
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            f = k32.CreateSymbolicLinkW
+            f.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            f.restype = ctypes.c_ubyte          # 该 API 返回 BOOLEAN（1 字节）
+            ok = f(link_path, target, 0x2)
+            return 0 if ok else ctypes.get_last_error()
+        err = _link_error(_call)
+        if err:
+            # 只留痕、不打断：下面还会依次尝试硬链接，最终失败原因由 ③ 汇总。
+            safety.log("create-link", "CreateSymbolicLinkW 失败（%s）: %s"
+                       % (err, link_path), level="WARN", ok=False)
     ok = _verify_link(link_path, target)
     if ok:
         return True, "符号链接"
@@ -397,6 +407,28 @@ def probe_link_support() -> dict:
     return out
 
 
+def _link_error(fn) -> str:
+    """调 CreateSymbolicLinkW / CreateHardLinkW 并返回可读的错误说明。
+
+    ⚠️ 为什么不能写 `ctypes.windll.kernel32.XxxW(...)` 再配 `ctypes.get_last_error()`：
+       windll 造出来的实例**没开 use_last_error**，CPython 就不会在调用后把线程
+       错误码存进 ctypes 的内部槽位，于是 get_last_error() **恒返回 0** ——
+       所有失败都显示成「错误码 0」（= ERROR_SUCCESS），排障时完全失去线索。
+       （core/ai.py 的 DPAPI 那段踩过同一个坑，那边已改用 WinDLL(use_last_error=True)。）
+       这里用 WinDLL(..., use_last_error=True) 现取，错误码才可信。
+    返回 "" 表示调用成功。
+    """
+    try:
+        err = fn()
+    except OSError as ex:              # WinDLL 在 use_last_error 下失败会抛 OSError
+        return str(ex)
+    except Exception as ex:            # noqa: BLE001  非 OSError 的意外（缺 API 等）
+        return "%s: %s" % (type(ex).__name__, ex)
+    if err:
+        return "错误码 %d" % err
+    return ""
+
+
 def _create_hardlink(link_path: str, target: str) -> tuple:
     """建硬链接。返回 (成功?, 说明)。
 
@@ -406,12 +438,20 @@ def _create_hardlink(link_path: str, target: str) -> tuple:
     """
     if os.path.lexists(link_path):
         return False, "目标已存在"
-    try:
-        ok = ctypes.windll.kernel32.CreateHardLinkW(link_path, target, None)
-    except Exception as ex:
-        return False, "CreateHardLinkW 异常: %s" % ex
-    if not ok:
-        return False, "CreateHardLinkW 失败（错误码 %s）" % ctypes.get_last_error()
+
+    def _call():
+        # 必须在函数内部取 WinDLL 实例：模块级持有的话，use_last_error 的
+        # 线程错误码槽位与「当前线程」绑定，跨线程复用不保证拿到本次调用的码。
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        pk = k32.CreateHardLinkW
+        pk.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p]
+        pk.restype = ctypes.c_int
+        ok = pk(link_path, target, None)
+        return 0 if ok else ctypes.get_last_error()
+
+    err = _link_error(_call)
+    if err:
+        return False, "CreateHardLinkW 失败（%s）" % err
     # 验证：必须是同一文件（硬链接的判据是 samefile，不是 islink）
     try:
         if os.path.samefile(link_path, target):
@@ -1022,6 +1062,9 @@ def workshop_download_direct(cfg: dict, item_id: str) -> dict:
         def say(msg):
             job["log"].append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
 
+        def cancelled() -> bool:
+            return job.get("state") == "cancelled"
+
         tmp_vpk = ""
         try:
             say("取 item 详情（Steam Web API，经 PowerShell 走系统代理）…")
@@ -1061,6 +1104,17 @@ def workshop_download_direct(cfg: dict, item_id: str) -> dict:
             t.start()
             ok, out = _ps_download(det["file_url"], tmp_vpk, timeout=DOWNLOAD_TIMEOUT)
             stop.set()
+            if cancelled():
+                # _ps_download 是一次性的 PowerShell 子进程，下载途中没法打断；
+                # 但至少不能在用户点了「取消」之后还把它入库。
+                # ⚠️ state 必须一起改：原来只写 result，于是 job_state 轮询
+                # 一直看到 "running" 直到线程 return —— 界面转圈不停，
+                # 前端 acJobPoll 也不会走 cancelled 分支。
+                job["state"] = "cancelled"
+                job["result"] = {"ok": False, "cancelled": True,
+                                 "error": "已取消（下载已中断，未入库）"}
+                say("已取消，未入库")
+                return
             if not ok:
                 job["state"] = "failed"
                 job["result"] = {"ok": False,
@@ -1177,6 +1231,9 @@ def install_steamcmd(ack: bool = False) -> dict:
         def say(msg):
             job["log"].append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
 
+        def cancelled() -> bool:
+            return job.get("state") == "cancelled"
+
         import urllib.request
         import zipfile
         dest = steamcmd_dir()
@@ -1191,6 +1248,16 @@ def install_steamcmd(ack: bool = False) -> dict:
                 got = 0
                 with open(zip_path, "wb") as fp:
                     while True:
+                        if cancelled():
+                            # 「取消」不能只是改个状态字：这个循环原先一路读到
+                            # 100 MB 下完才结束，用户点了取消还在偷偷写磁盘。
+                            # state 必须一起改 —— 否则 job_state 一直报 running，
+                            # 前端轮询看不到终结态，进度条永远停在那。
+                            job["state"] = "cancelled"
+                            job["result"] = {"ok": False, "cancelled": True,
+                                             "error": "已取消（下载未完成，未解压）"}
+                            say("已取消")
+                            return
                         chunk = resp.read(256 * 1024)
                         if not chunk:
                             break
@@ -1223,6 +1290,15 @@ def install_steamcmd(ack: bool = False) -> dict:
                              "error": "安装失败：%s: %s（可去 developer.valvesoftware.com "
                                       "手动下载 SteamCMD，或检查网络/代理）"
                                       % (type(ex).__name__, ex)}
+        finally:
+            # 失败/取消时那个半截 zip 会一直躺在 data/ 里：正常路径已经走回收站，
+            # 这里把残余清掉（不存在就什么也不做）。下一次安装本来也会 open(wb)
+            # 覆盖它，但留着半截文件会让「占用空间」和排障都变得莫名其妙。
+            if os.path.isfile(zip_path) and job.get("state") != "done":
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
 
     threading.Thread(target=run, daemon=True, name="sc-install").start()
     return {"ok": True, "job": job_id}
@@ -1265,6 +1341,9 @@ def workshop_download(cfg: dict, item_id: str, steamcmd: str = "") -> dict:
         def say(msg):
             job["log"].append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
 
+        def cancelled() -> bool:
+            return job.get("state") == "cancelled"
+
         try:
             say("启动 SteamCMD 下载 item %s（App %s）..." % (item_id, STEAM_APP_ID))
             # +login anonymous：公开 item 匿名可下。登录态的 item 会失败并如实报错。
@@ -1274,13 +1353,58 @@ def workshop_download(cfg: dict, item_id: str, steamcmd: str = "") -> dict:
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace",
                                     creationflags=_NO_WIN)
-            out_lines = []
-            for line in proc.stdout:
-                line = line.rstrip()
-                out_lines.append(line)
-                if line.strip():
-                    say(line.strip()[:120])
-            proc.wait(timeout=DOWNLOAD_TIMEOUT)
+            # 交出去之后 cancel_job 才能 kill 到它。赋值与 Popen 之间没有可被
+            # 并发打断的窗口（都是本线程顺序执行），不需要加锁。
+            job["proc"] = proc
+            out_lines: list[str] = []
+            deadline = time.monotonic() + DOWNLOAD_TIMEOUT
+
+            # 输出必须在**后台线程**里读：主线程若 `for line in proc.stdout`，
+            # SteamCMD 一旦不吐新行（正在闷头下大包，或卡在网络重试里），
+            # 这个循环就永远不返回，下面那句 proc.wait(timeout=...) 根本执行
+            # 不到，DOWNLOAD_TIMEOUT 形同虚设，取消也杀不掉。主线程改为
+            # 每秒轮询一次 wait(timeout=1.0)，才有机会看超时与取消。
+            def pump():
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip()
+                    out_lines.append(line)
+                    if line.strip():
+                        say(line.strip()[:120])
+
+            reader = threading.Thread(target=pump, daemon=True,
+                                      name="ws-dl-out-%s" % item_id)
+            reader.start()
+
+            # 等它自己结束，最多等到 deadline —— 超时/取消两条路都要先把
+            # 子进程收掉，否则 steamcmd.exe 会留在后台占着 work 目录，
+            # 下一次下载解包同名目录时直接失败。
+            while True:
+                try:
+                    proc.wait(timeout=1.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancelled():
+                        _kill_tree(proc)
+                        job["state"] = "cancelled"
+                        job["result"] = {"ok": False, "error": "已取消（SteamCMD 已终止）"}
+                        say("已取消，SteamCMD 已终止")
+                        return
+                    if time.monotonic() >= deadline:
+                        # 先杀子树再把 TimeoutExpired 抛给下面那个 except 统一收尾
+                        # （超时文案在 except 里只有一份，别在两处各写一遍）。
+                        _kill_tree(proc)
+                        raise
+            # 子进程退出后输出管道可能还有残留，给它一小会儿把尾部收完
+            reader.join(timeout=5.0)
+            # 子进程已退出（无论成功还是失败），别再让 cancel_job 拿到它去 kill：
+            # PID 可能已经被系统复用。
+            job["proc"] = None
+            if cancelled():
+                job["state"] = "cancelled"
+                job["result"] = {"ok": False, "cancelled": True,
+                                 "error": "已取消（SteamCMD 已终止），下载产物未导入"}
+                say("已取消，下载产物未导入")
+                return
             # 产物目录：<work>/steamapps/workshop/content/550/<item_id>/
             ugc = os.path.join(work, "steamapps", "workshop", "content",
                                STEAM_APP_ID, item_id)
@@ -1312,22 +1436,42 @@ def workshop_download(cfg: dict, item_id: str, steamcmd: str = "") -> dict:
                 }
                 return
             say("下载完成：%d 个 VPK" % len(vpks))
-            # 多个 VPK 时取最大的（主体通常是最大的那个；附属件 ingest 会一并处理）
+            # 多个 VPK 时优先导入最大的那个（主体通常是最大的；附属件随后处理）。
+            # 原注释写的是「取最大的」，而代码里的 sort 只是**排序**，真正的
+            # 「是不是主体」交给下面 ingest 自己判断 —— 这里把措辞与行为对齐，
+            # 免得后人以为有个筛选逻辑漏掉了。
             vpks.sort(key=lambda p: -os.path.getsize(p))
             results = []
             for vp in vpks[:manager.BATCH_LIMIT]:
+                if cancelled():
+                    # 取消只对「还没导入的部分」生效：已经 ingest 完的保持原样
+                    job["state"] = "cancelled"
+                    job["result"] = {"ok": False, "cancelled": True,
+                                     "error": "已取消：停在导入阶段，前 %d 项已导入" % len(results),
+                                     "ingested": results}
+                    say("已取消，已导入 %d 项" % len(results))
+                    return
                 r = ingest(cfg, vp, mode="copy")   # copy：ugc 产物留给 SteamCMD 管
                 r["src"] = vp
                 results.append(r)
                 if not r.get("ok"):
                     break                            # 出错立刻停（铁律）
             ok_all = all(r.get("ok") for r in results)
+            # ⚠️ vpks 理论上非空（上面 `if not vpks: return`），但 ingest 可能因为
+            #    上限/过滤一个都没跑，results 为空时 all([]) 为 True —— 那就成了
+            #    「state=done 但什么都没导入」，前端会弹绿字「下载并入库完成」。
+            if not results:
+                job["state"] = "failed"
+                job["result"] = {"ok": False,
+                                 "error": "下载完成但没有任何文件被导入（见运行日志）",
+                                 "raw": out_lines[-20:]}
+                return
             job["state"] = "done" if ok_all else "failed"
             job["result"] = {"ok": ok_all, "ingested": results,
                              "title": results[0].get("title", "") if results else ""}
         except subprocess.TimeoutExpired:
             job["state"] = "failed"
-            job["result"] = {"ok": False, "error": "下载超时（%d 秒），可重试"
+            job["result"] = {"ok": False, "error": "下载超时（%d 秒），可重试（已终止 SteamCMD）"
                              % DOWNLOAD_TIMEOUT}
         except Exception as ex:
             job["state"] = "failed"
@@ -1335,6 +1479,33 @@ def workshop_download(cfg: dict, item_id: str, steamcmd: str = "") -> dict:
 
     threading.Thread(target=run, daemon=True, name="ws-dl-%s" % item_id).start()
     return {"ok": True, "job": job_id}
+
+
+def _kill_tree(proc) -> None:
+    """把子进程连同它的子进程一起杀掉（best-effort，绝不再抛出）。
+
+    ⚠️ 不能用 proc.kill()：SteamCMD 自己会再拉子进程（更新器/启动器），
+    只杀父进程会留下一串孤儿继续占着 work 目录的文件句柄。
+    Windows 上用 taskkill /T 才连整棵树。
+    """
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            # /T = 终止整棵树，/F = 强制。CREATE_NO_WINDOW 防止闪出一个黑窗。
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10, creationflags=_NO_WIN)
+        else:
+            proc.kill()
+    except Exception:                                  # noqa: BLE001
+        pass                                           # 杀不掉也不能让调用方炸
+    try:
+        proc.wait(timeout=5)
+    except Exception:                                  # noqa: BLE001
+        pass
 
 
 def job_state(job_id: str) -> dict:
@@ -1350,11 +1521,27 @@ def job_state(job_id: str) -> dict:
 
 
 def cancel_job(job_id: str) -> dict:
+    """把任务标记为已取消，并**真正**让下载线程收手。
+
+    取消分两处生效：
+      ① 这里立刻把子进程（steamcmd.exe 及其子进程树）杀掉 —— 不然「取消」
+         只是界面上的一个字符串，磁盘还在往下写；
+      ② 下载线程自己在主循环/导入循环里看 state，发现 cancelled 就走取消分支，
+         不会继续把产物搬进仓库。
+    其余任务类型（UGC 直下 / SteamCMD 安装）没有子进程可杀，靠 ② 的那份
+    job["state"] 判断生效。
+    """
     with _JOBS_LOCK:
         j = _JOBS.get(job_id)
         if not j:
             return {"ok": False, "error": "任务不存在"}
         if j["state"] == "running":
             j["state"] = "cancelled"
-            return {"ok": True}
-        return {"ok": False, "error": "任务已结束（%s），无法取消" % j["state"]}
+            proc = j.get("proc")
+        else:
+            return {"ok": False, "error": "任务已结束（%s），无法取消" % j["state"]}
+    # 锁外杀进程：taskkill 可能等上几秒，不该把 _JOBS_LOCK 一起占住
+    # （job_state 轮询全靠它，卡住的话界面会整片白）。
+    if proc is not None:
+        _kill_tree(proc)
+    return {"ok": True}
