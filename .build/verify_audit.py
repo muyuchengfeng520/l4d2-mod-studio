@@ -66,6 +66,32 @@ def mod(key: str, vpaths: list, enabled: bool = True) -> dict:
             "_vpaths": vpaths, "_vpk_path": os.path.join(_WORK, key)}
 
 
+def entry_refs(tree: ast.AST) -> dict:
+    """按作用域收集 MULTI_ADDON_ENTRY 的「读取」引用：{"<模块级>" 或函数名: [行号]}。
+
+    两个刻意的设计：
+      1. 只认 ast.Load —— 常量定义处（`MULTI_ADDON_ENTRY = re.compile(...)`）是 Store，
+         不该算「引用」，否则守卫会把自己的定义判成越界。
+      2. 按作用域分组、且把函数外的引用归到 "<模块级>" —— 旧写法只遍历 FunctionDef，
+         模块级引用会被整个漏掉；而一旦漏掉，报错里只会显示 {} ，看起来像
+         「这个常量压根没被引用」，把排查方向指反了。
+    """
+    refs = {}
+
+    def scan(node, scope):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                scan(child, child.name)      # 进入函数，作用域名换成函数名
+                continue
+            if (isinstance(child, ast.Name) and child.id == "MULTI_ADDON_ENTRY"
+                    and isinstance(child.ctx, ast.Load)):
+                refs.setdefault(scope, []).append(child.lineno)
+            scan(child, scope)
+
+    scan(tree, "<模块级>")
+    return refs
+
+
 def main() -> int:
     # ---------------------------------------------------------------- A
     print("=" * 66)
@@ -214,21 +240,33 @@ def main() -> int:
     def _():
         src = open(audit.__file__, "r", encoding="utf-8").read()
         tree = ast.parse(src)
-        owners = {}        # 函数名 -> 引用它的行号列表
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.Name) and sub.id == "MULTI_ADDON_ENTRY":
-                        owners.setdefault(node.name, []).append(sub.lineno)
-        # 只允许出现在 script_lib_conflicts 一个函数里
-        assert set(owners) == {"script_lib_conflicts"}, owners
+        refs = entry_refs(tree)          # {作用域: [行号]}，"<模块级>" 也算一个作用域
+
+        # 模块级引用最隐蔽（谁都能拿到这个规则），单独先报，并带上行号；
+        # 旧写法只遍历 FunctionDef，这种引用会被漏掉，失败信息还只剩一个 {}。
+        assert "<模块级>" not in refs, (
+            "MULTI_ADDON_ENTRY 在模块级被读取（第 %s 行）—— 只许在 script_lib_conflicts() "
+            "内部使用；模块级引用等于把规则暴露给所有函数"
+            % ", ".join(map(str, refs["<模块级>"])))
+
+        bad = {k: v for k, v in refs.items() if k != "script_lib_conflicts"}
+        detail = "；".join("%s（第 %s 行）" % (k, ", ".join(map(str, v)))
+                          for k, v in sorted(bad.items()))
+        assert not bad, (
+            "MULTI_ADDON_ENTRY 被这些函数读取：%s；只允许 script_lib_conflicts()" % detail)
+
+        # 反向兜底：常量在 script_lib_conflicts 里必须真的被读到，否则守卫形同虚设
+        # （比如有人把规则内联成字面量、把常量删了，这里就该红）。
+        assert refs.get("script_lib_conflicts"), (
+            "script_lib_conflicts() 里没有读取 MULTI_ADDON_ENTRY —— 守卫已失效，"
+            "确认是规则被内联/删除，还是函数被改名")
 
     # ---------------------------------------------------------------- D
     print("=" * 66)
     print("D) conflicts 的 PAIR_CAP 提前判")
     print("=" * 66)
 
-    @check("700 个 mod 抢同一文件 → truncated 为 True 且耗时 < 10s")
+    @check("700 个 mod 抢同一文件 → pairs_truncated 为 True（耗时只做兜底）")
     def _():
         p = "models/survivors/survivor_x.mdl"
         ms = [{"key": "m%d" % i, "enabled": True, "_vpk_path": "x",
@@ -236,8 +274,11 @@ def main() -> int:
         t0 = time.monotonic()
         r = audit.conflicts(ms)
         dt = time.monotonic() - t0
+        # 真判据只有一条：pairs_truncated 为 True，证明没把 C(700,2)=244650 个组合跑完。
+        # 耗时只作「病态退化」兜底：阈值给到 30s，因为原来卡 10s 在慢机器/实时杀毒
+        # 扫描下会假红（flaky）；而这条要抓的是分钟级退化，用不着卡得那么紧。
         assert r["pairs_truncated"] is True, "组合数 C(700,2)=244650 必须被截断"
-        assert dt < 10.0, "耗时 %.1fs，说明还是在先把组合跑完再判" % dt
+        assert dt < 30.0, "耗时 %.1fs，远超兜底线，疑似先把组合跑完才判截断" % dt
 
     # ---------------------------------------------------------------- E
     print("=" * 66)

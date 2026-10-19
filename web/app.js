@@ -123,9 +123,15 @@ const API_TIMEOUT = 60000;
      /api/pick-file 要等用户在系统对话框里选文件（服务端 join 最多 180 秒）。
    漏掉的后果是前端 60 秒就 abort，而服务端还在继续写盘 —— 用户看到「请求超时」，
    后台却真的把 mod 下完/入库了，两边状态对不上。 */
+/* 下面用 path.startsWith() 前缀匹配，所以只要写前缀就够了 ——
+   '/api/gamefiles/restore' 已经覆盖 '/api/gamefiles/restore-all'，无需重复登记；
+   反之若只写 restore-all，restore 自己就漏了，所以留短的、删长的。
+   ⚠️ 但前缀不要带结尾的 '/'：'/api/staging/' 匹配不到精确路径 '/api/staging'，
+   而那条 GET 正是最慢的入口之一（safety.list_staging() 会对隔离区里每个**目录**
+   递归 dir_size；刚隔离进一个大 mod 时首次计算可达数万个文件，超过 60 秒才返回）。 */
 const API_SLOW = ['/api/scan', '/api/rescan', '/api/audit', '/api/vpk/', '/api/ai/', '/api/isolate',
-                  '/api/staging/', '/api/gamefiles/replace', '/api/gamefiles/restore',
-                  '/api/gamefiles/write', '/api/gamefiles/restore-all',
+                  '/api/staging', '/api/gamefiles/replace', '/api/gamefiles/restore',
+                  '/api/gamefiles/write',
                   '/api/pick-file', '/api/open-folder', '/api/config',
                   '/api/acquire/workshop', '/api/acquire/ingest',
                   '/api/acquire/install', '/api/reassign/apply'];
